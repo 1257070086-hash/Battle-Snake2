@@ -51,33 +51,25 @@ def choose_move(data: dict) -> str:
     # 危险区预标记（敌蛇下回合可达格）
     danger_zone = compute_danger_zone(live_enemies, state["occupied"], width, height, me["id"], me["length"])
 
-    # 获取安全走法（含危险区规避）
+    # 获取安全走法（先不过滤危险区，得到基础安全方向）
     my_safe = get_safe_moves(
         state["my_head"], state, me["id"], me["length"],
-        width, height, aggressive=not is_endgame,
-        danger_zone=danger_zone
+        width, height, aggressive=True, danger_zone=set()
     )
-    if not my_safe:
-        # 安全走法为空时，退回忽略危险区
-        my_safe = get_safe_moves(
-            state["my_head"], state, me["id"], me["length"],
-            width, height, aggressive=True, danger_zone=set()
-        )
     if not my_safe:
         return "up"
     if len(my_safe) == 1:
         return list(my_safe.keys())[0]
 
+    # 在基础安全方向里，过滤危险区（但保留至少1个方向）
+    safe_no_danger = {d: p for d, p in my_safe.items() if p not in danger_zone}
+    if safe_no_danger:
+        my_safe = safe_no_danger
+
     # 走法排序：Flood Fill 大的优先（让 Alpha-Beta 更早剪枝）
     my_safe = sort_moves(my_safe, state, width, height)
 
     best_move = list(my_safe.keys())[0]
-
-    # 残局专用策略：激进追击
-    if is_endgame and live_enemies:
-        endgame_move = endgame_strategy(state, my_safe, me, live_enemies[0], food, width, height, start_time)
-        if endgame_move:
-            return endgame_move
 
     # 迭代加深：先搜深度3兜底，再搜深度6
     for depth in [3, MAX_DEPTH]:
@@ -200,7 +192,6 @@ def alphabeta(state, depth, alpha, beta, is_maximizing,
         if not my_safe:
             return -1000
 
-        my_safe = sort_moves(my_safe, state, width, height)
         value = float("-inf")
         for _, my_next in my_safe.items():
             new_state = step_state(state, me["id"], my_next, width, height)
@@ -256,9 +247,10 @@ def build_state(me, snakes, food, width, height):
 
     for snake in snakes:
         body    = snake["body"]
-        head_pos = (body[0]["x"], body[0]["y"])
-        # 精确判断：蛇头在食物上说明上回合吃了食物，尾部不收缩
-        just_ate = head_pos in food_set
+        # 精确判断：身体第一节和第二节重叠说明上回合刚吃了食物
+        just_ate = (len(body) >= 2 and
+                    body[0]["x"] == body[1]["x"] and
+                    body[0]["y"] == body[1]["y"])
         snake_meta[snake["id"]] = {"just_ate": just_ate}
 
         for i, seg in enumerate(body):
