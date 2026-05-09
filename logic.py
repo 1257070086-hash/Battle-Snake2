@@ -86,11 +86,21 @@ def choose_move(data: dict) -> str:
         if move:
             best_move = move
 
-    # 短蛇阶段：若 Minimax 没有选择食物方向，但有安全的食物方向，优先食物
-    if me["length"] < 8 and food:
-        food_moves = _best_food_move(my_safe, food, state, width, height, me["length"])
-        if food_moves:
-            best_move = food_moves
+    # 食物兜底：以下任一条件触发强制找食
+    #   1. 短蛇（< 8）：始终优先找食
+    #   2. 任意长度血量 < 40：快饿死了，必须找食
+    #   3. 任意长度血量 < 60 且地图上只剩 ≤ 2 个食物：食物稀缺，提前抢
+    health     = me["health"]
+    food_count = len(food)
+    force_food = (
+        me["length"] < 8
+        or health < 40
+        or (health < 60 and food_count <= 2)
+    )
+    if force_food and food:
+        food_move = _best_food_move(my_safe, food, state, width, height, me["length"])
+        if food_move:
+            best_move = food_move
 
     return best_move
 
@@ -485,6 +495,10 @@ def evaluate(state, me, food, width, height):
     # 血量权重：短蛇始终积极（最低0.8），血量越低越急
     if my_len < 8:
         health_w = max(0.8, (120 - health) / 50.0)  # 短蛇：血量权重恒高
+    elif health < 40:
+        health_w = 3.0   # 任意长度快饿死：食物权重爆炸
+    elif health < 60:
+        health_w = 1.8   # 血量偏低：食物权重明显提升
     else:
         health_w = max(0.5, (100 - health) / 50.0)
 
