@@ -86,49 +86,58 @@ def choose_move(data: dict) -> str:
         if move:
             best_move = move
 
-    # 食物兜底：连续判断 + 极端危机硬兜底
-    #   正常情况由 Minimax 的连续 health_w 曲线处理
-    #   两种情况强制兜底：
-    #     1. 短蛇（< 8）：始终优先找食
-    #     2. 真实危机：最近食物的步数 >= 当前血量（不兜底必死）
-    #     3. 极端：血量 < 20
-    health     = me["health"]
+    # 食物兜底：极端危机时强制找食，但必须验证 Minimax 结果是否有问题
+    #   只有当 Minimax 选的方向「离所有食物太远」时才覆盖
+    #   如果 Minimax 自己已经在往食物走，就信任它
+    health      = me["health"]
     my_head_pos = state["my_head"]
     min_food_dist = min((manhattan(my_head_pos, f) for f in food), default=999) if food else 999
     force_food = (
         me["length"] < 8
-        or health <= 25                               # 血量极低直接兜底
-        or (food and min_food_dist >= health - 5)    # 步数快追不上血量了
+        or health <= 25
+        or (food and min_food_dist >= health - 5)
     )
     if force_food and food:
         food_move = _best_food_move(my_safe, food, state, width, height, me["length"])
         if food_move:
-            best_move = food_move
+            # 关键：只有当 _best_food_move 选的方向比 Minimax 更靠近食物时才覆盖
+            # 如果 Minimax 结果本身已经是最近食物方向或有足够空间，就信任 Minimax
+            minimax_pos  = my_safe.get(best_move)
+            foodmove_pos = my_safe.get(food_move)
+            if minimax_pos and foodmove_pos:
+                minimax_food_dist  = min(manhattan(minimax_pos, f) for f in food)
+                foodmove_food_dist = min(manhattan(foodmove_pos, f) for f in food)
+                # 只有 food_move 比 Minimax 明显更靠近食物（差2步以上）才覆盖
+                if foodmove_food_dist < minimax_food_dist - 1:
+                    best_move = food_move
 
     return best_move
 
 
 def _best_food_move(safe_moves, food, state, width, height, my_len):
     """
-    短蛇辅助：找可达食物中最近、最安全的走法。
-    只有当食物方向通过了 check_space（有足够空间）才返回。
+    找可达食物中最近、最安全的走法。
+    关键修复：空间检查从「走的那一步」出发，而不是从「食物位置」出发。
+    确保走过去的路有足够空间展开，而不只是食物附近有空间。
     """
     occupied = state["occupied"]
     best_dir  = None
-    best_dist = float("inf")
+    best_score = float("-inf")  # score = -dist（越近越好），空间不足则跳过
 
-    for direction, pos in safe_moves.items():
+    for direction, next_pos in safe_moves.items():
+        # 关键修复：从「我走的下一步」检查空间，不从食物检查
+        step_ff = flood_fill(next_pos[0], next_pos[1], width, height, occupied,
+                             max_cells=my_len * 3)
+        if step_ff < my_len:
+            # 走这步空间不够展开，跳过（防围堵）
+            continue
+
         for f in food:
-            dist = manhattan(pos, f)
-            if dist < best_dist:
-                # 吃完后空间检查（放宽：只需 > my_len/2）
-                sim_len  = my_len + 1
-                min_safe = max(3, sim_len // 2)
-                ff = flood_fill(f[0], f[1], width, height, occupied,
-                                max_cells=sim_len * 3)
-                if ff >= min_safe:
-                    best_dist = dist
-                    best_dir  = direction
+            dist = manhattan(next_pos, f)
+            score = -dist
+            if score > best_score:
+                best_score = score
+                best_dir   = direction
 
     return best_dir
 
@@ -197,9 +206,13 @@ def sort_moves(moves: dict, state, width, height) -> dict:
         ff = flood_fill(pos[0], pos[1], width, height, state["occupied"], max_cells=50)
 
         if my_len < 8 and food_set:
-            # 短蛇：离最近食物越近分越高，叠加少量空间分避免死路
-            min_food_dist = min(manhattan(pos, f) for f in food_set)
-            score = -min_food_dist * 10 + ff * 0.1
+            # 短蛇：离最近食物越近分越高
+            # 但必须先过空间检查：走这步后空间 < my_len 则给极低分（不走死路）
+            if ff < my_len:
+                score = -9999   # 空间不足，排到最后
+            else:
+                min_food_dist = min(manhattan(pos, f) for f in food_set)
+                score = -min_food_dist * 10 + ff * 0.1
         else:
             score = ff
 
