@@ -150,11 +150,19 @@ def endgame_strategy(state, my_safe, me, enemy, food, width, height):
     my_len = state["my_length"]
     e_len  = enemy["length"]
     e_head = (enemy["head"]["x"], enemy["head"]["y"])
+    occupied = state["occupied"]
 
     if my_len > e_len:
-        # 我更长：选距离敌蛇头最近的方向（压缩空间）
-        best = min(my_safe.items(),
-                   key=lambda item: manhattan(item[1], e_head))
+        # 我更长：选「走了这步后对手Flood Fill最小」的方向（真正围堵）
+        # 比只靠近对手头更精准：模拟我走到 pos 后，对手的可达空间
+        best = min(
+            my_safe.items(),
+            key=lambda item: flood_fill(
+                e_head[0], e_head[1], width, height,
+                occupied | {item[1]},   # 我走到这格后，这格变为障碍
+                max_cells=200
+            )
+        )
         return best[0]
     else:
         food_list = list(state["food_set"])
@@ -164,7 +172,7 @@ def endgame_strategy(state, my_safe, me, enemy, food, width, height):
             return best[0]
         best = max(my_safe.items(),
                    key=lambda item: flood_fill(
-                       item[1][0], item[1][1], width, height, state["occupied"]))
+                       item[1][0], item[1][1], width, height, occupied))
         return best[0]
 
 
@@ -197,24 +205,40 @@ def sort_moves(moves: dict, state, width, height) -> dict:
     排序逻辑：
     - 短蛇(< 8)：食物距离近的方向优先，确保食物方向被优先搜索
     - 中长蛇：Flood Fill 空间大的优先，Alpha-Beta 更早剪枝
+    - 全程：加 trap_bonus，走这步能切断对手多少空间（围堵奖励）
     """
-    my_len   = state["my_length"]
-    food_set = state["food_set"]
-    scored   = []
+    my_len    = state["my_length"]
+    my_id     = state.get("me_id")
+    food_set  = state["food_set"]
+    occupied  = state["occupied"]
+    enemies   = [s for s in state["live_snakes"] if s["id"] != my_id]
+    scored    = []
 
     for direction, pos in moves.items():
-        ff = flood_fill(pos[0], pos[1], width, height, state["occupied"], max_cells=50)
+        ff = flood_fill(pos[0], pos[1], width, height, occupied, max_cells=50)
 
         if my_len < 8 and food_set:
-            # 短蛇：离最近食物越近分越高
-            # 但必须先过空间检查：走这步后空间 < my_len 则给极低分（不走死路）
             if ff < my_len:
-                score = -9999   # 空间不足，排到最后
+                score = -9999
             else:
                 min_food_dist = min(manhattan(pos, f) for f in food_set)
                 score = -min_food_dist * 10 + ff * 0.1
         else:
             score = ff
+
+        # trap_bonus：走到 pos 后，估算对手空间减少量
+        # 只做一次轻量计算（max_cells=50 限速），不影响性能
+        trap_bonus = 0.0
+        if enemies:
+            occ_after = occupied | {pos}
+            for s in enemies:
+                eh = (s["head"]["x"], s["head"]["y"])
+                e_ff_before = flood_fill(eh[0], eh[1], width, height, occupied,  max_cells=50)
+                e_ff_after  = flood_fill(eh[0], eh[1], width, height, occ_after, max_cells=50)
+                reduction   = e_ff_before - e_ff_after
+                if reduction > 0:
+                    trap_bonus = max(trap_bonus, reduction * 0.3)
+        score += trap_bonus
 
         scored.append((direction, pos, score))
 
@@ -582,11 +606,49 @@ def evaluate(state, me, food, width, height):
                 attack_bonus = 1.0
                 break
 
-    return (voronoi_score * w_voronoi
-            + ff_score    * 1.0
-            + food_score  * w_food * health_w
-            + len_adv     * w_len_adv
-            + attack_bonus * 0.5)
+    # ⑥ 防墙角：墙边惩罚 + 中心吸引
+    #   wall_score:   离最近墙越远越好（0=贴墙, 1=中心）
+    #   center_score: 离棋盘中心越近越好（0=角落, 1=中心）
+    cx_center = (width  - 1) / 2.0
+    cy_center = (height - 1) / 2.0
+    dist_to_wall = min(my_pos[0], width  - 1 - my_pos[0],
+                       my_pos[1], height - 1 - my_pos[1])
+    center_dist  = (abs(my_pos[0] - cx_center) + abs(my_pos[1] - cy_center))
+    max_center_dist = cx_center + cy_center          # 角落时最大值
+    wall_score   = dist_to_wall / max(width, height) # 0(贴墙) → 较大(内部)
+    center_score = 1.0 - center_dist / max(max_center_dist, 1.0)  # 0(角) → 1(中心)
+    position_score = wall_score * 0.4 + center_score * 0.3
+
+    # ⑦ 全程围堵：对手空间压力（任何长度阶段都算，长蛇权重更大）
+    #   对每个敌蛇计算其 Flood Fill，空间越小 → 围堵效果越好 → 加分越多
+    enemy_pressure = 0.0
+    if enemies:
+        for s in enemies:
+            eh = (s["head"]["x"], s["head"]["y"])
+            e_ff = flood_fill(eh[0], eh[1], width, height, occupied, max_cells=100)
+            e_len = s["length"]
+            # ratio = 对手空间/对手身长；ratio越小 → 对手越被困
+            ratio    = e_ff / max(e_len, 1)
+            pressure = 1.0 / (1.0 + ratio)   # ratio→0时 pressure→1，ratio→∞时 pressure→0
+            enemy_pressure = max(enemy_pressure, pressure)
+
+    # 围堵权重：长蛇时更激进（我方长度越大于对手，越值得围）
+    if enemies:
+        max_enemy_len = max(s["length"] for s in enemies)
+        len_ratio = my_len / max(max_enemy_len, 1)
+    else:
+        len_ratio = 2.0
+    # len_ratio > 1: 我更长，围堵权重放大；< 1: 我更短，维持基础权重
+    w_pressure = 1.0 + max(0.0, len_ratio - 1.0) * 1.5   # 短蛇1.0，等长1.0，长出50%→2.5
+    w_pressure = min(w_pressure, 3.0)                      # 上限3.0
+
+    return (voronoi_score    * w_voronoi
+            + ff_score       * 1.0
+            + food_score     * w_food * health_w
+            + len_adv        * w_len_adv
+            + attack_bonus   * 0.5
+            + position_score * 0.8
+            + enemy_pressure * w_pressure)
 
 
 # ─────────────────────────────────────────────
