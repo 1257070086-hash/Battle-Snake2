@@ -86,7 +86,38 @@ def choose_move(data: dict) -> str:
         if move:
             best_move = move
 
+    # 短蛇阶段：若 Minimax 没有选择食物方向，但有安全的食物方向，优先食物
+    if me["length"] < 8 and food:
+        food_moves = _best_food_move(my_safe, food, state, width, height, me["length"])
+        if food_moves:
+            best_move = food_moves
+
     return best_move
+
+
+def _best_food_move(safe_moves, food, state, width, height, my_len):
+    """
+    短蛇辅助：找可达食物中最近、最安全的走法。
+    只有当食物方向通过了 check_space（有足够空间）才返回。
+    """
+    occupied = state["occupied"]
+    best_dir  = None
+    best_dist = float("inf")
+
+    for direction, pos in safe_moves.items():
+        for f in food:
+            dist = manhattan(pos, f)
+            if dist < best_dist:
+                # 吃完后空间检查（放宽：只需 > my_len/2）
+                sim_len  = my_len + 1
+                min_safe = max(3, sim_len // 2)
+                ff = flood_fill(f[0], f[1], width, height, occupied,
+                                max_cells=sim_len * 3)
+                if ff >= min_safe:
+                    best_dist = dist
+                    best_dir  = direction
+
+    return best_dir
 
 
 # ─────────────────────────────────────────────
@@ -140,10 +171,27 @@ def compute_danger_zone(enemies, occupied, width, height, my_id, my_len):
 # ─────────────────────────────────────────────
 
 def sort_moves(moves: dict, state, width, height) -> dict:
-    scored = []
+    """
+    排序逻辑：
+    - 短蛇(< 8)：食物距离近的方向优先，确保食物方向被优先搜索
+    - 中长蛇：Flood Fill 空间大的优先，Alpha-Beta 更早剪枝
+    """
+    my_len   = state["my_length"]
+    food_set = state["food_set"]
+    scored   = []
+
     for direction, pos in moves.items():
         ff = flood_fill(pos[0], pos[1], width, height, state["occupied"], max_cells=50)
-        scored.append((direction, pos, ff))
+
+        if my_len < 8 and food_set:
+            # 短蛇：离最近食物越近分越高，叠加少量空间分避免死路
+            min_food_dist = min(manhattan(pos, f) for f in food_set)
+            score = -min_food_dist * 10 + ff * 0.1
+        else:
+            score = ff
+
+        scored.append((direction, pos, score))
+
     scored.sort(key=lambda x: x[2], reverse=True)
     return {d: p for d, p, _ in scored}
 
@@ -416,12 +464,14 @@ def evaluate(state, me, food, width, height):
     my_id    = me["id"]
 
     # 长度阶段动态权重
-    if my_len < 8:
-        w_voronoi, w_food, w_len_adv = 1.0, 3.5, 0.5
-    elif my_len < 15:
-        w_voronoi, w_food, w_len_adv = 2.5, 2.0, 1.0
-    else:
-        w_voronoi, w_food, w_len_adv = 4.0, 0.8, 1.5
+    if my_len < 8:      # 短蛇：疯狂吃食，Voronoi 几乎不看
+        w_voronoi, w_food, w_len_adv = 0.5, 5.0, 0.3
+    elif my_len < 12:   # 中短蛇：食物+地盘并重
+        w_voronoi, w_food, w_len_adv = 2.0, 3.0, 0.8
+    elif my_len < 18:   # 中蛇：平衡
+        w_voronoi, w_food, w_len_adv = 3.0, 1.5, 1.0
+    else:               # 长蛇：争地盘为主
+        w_voronoi, w_food, w_len_adv = 4.5, 0.5, 1.5
 
     # ① Voronoi
     voronoi_mine, voronoi_total = voronoi_control(state, my_id, width, height)
@@ -431,10 +481,15 @@ def evaluate(state, me, food, width, height):
     ff = flood_fill(my_pos[0], my_pos[1], width, height, occupied, max_cells=100)
     ff_score = ff / (width * height)
 
-    # ③ 食物分（Bug3 修复：对每个食物独立评估，选最优安全食物）
-    health_w  = max(0.5, (100 - health) / 50.0)
-    food_list = list(state["food_set"])
-    enemies   = [s for s in snakes if s["id"] != my_id]
+    # ③ 食物分（每个食物独立评估，选最优安全食物）
+    # 血量权重：短蛇始终积极（最低0.8），血量越低越急
+    if my_len < 8:
+        health_w = max(0.8, (120 - health) / 50.0)  # 短蛇：血量权重恒高
+    else:
+        health_w = max(0.5, (100 - health) / 50.0)
+
+    food_list  = list(state["food_set"])
+    enemies    = [s for s in snakes if s["id"] != my_id]
     food_score = 0.0
 
     if food_list:
@@ -444,27 +499,35 @@ def evaluate(state, me, food, width, height):
             base = 1.0 / (1 + my_dist)
 
             # 独立判断每个食物的竞争和危险程度
-            contested  = False
-            dangerous  = False
+            contested = False
+            dangerous = False
             for s in enemies:
                 eh = (s["head"]["x"], s["head"]["y"])
-                if manhattan(eh, f) <= my_dist:
+                e_dist = manhattan(eh, f)
+                # 竞争：敌蛇比我近 且 敌蛇比我长（等长也算危险）
+                if e_dist < my_dist and s["length"] >= my_len:
                     contested = True
-                if manhattan(eh, f) <= 1 and s["length"] >= my_len:
+                # 危险：食物紧挨大蛇头（头对头概率极高）
+                if e_dist <= 1 and s["length"] >= my_len:
                     dangerous = True
 
             if dangerous:
-                base *= 0.1
+                base *= 0.15          # 危险食物：强力降权
             elif contested:
-                base *= 0.5
+                # 短蛇阶段：有竞争也要抢，只轻微降权
+                if my_len < 8:
+                    base *= 0.8       # 短蛇：竞争食物仍大胆去
+                else:
+                    base *= 0.5       # 中长蛇：让步
 
-            # 吃完后空间检查
+            # 吃完后空间检查（短蛇放宽阈值：只要有 my_len/2 的空间就行）
             if my_dist <= 3:
                 sim_len  = my_len + 1
+                min_safe = sim_len // 2 if my_len < 8 else sim_len
                 food_ff  = flood_fill(f[0], f[1], width, height, occupied,
-                                      max_cells=sim_len * 2)
-                if food_ff < sim_len:
-                    base *= 0.2
+                                      max_cells=sim_len * 3)
+                if food_ff < min_safe:
+                    base *= 0.2       # 真正的死路才降权
 
             best_food_score = max(best_food_score, base)
 
