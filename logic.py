@@ -187,7 +187,8 @@ def alphabeta(state, depth, alpha, beta, is_maximizing,
     if is_maximizing:
         my_safe = get_safe_moves(
             state["my_head"], state, me["id"], state["my_length"],
-            width, height, aggressive=True, danger_zone=set()  # 搜索层不预标记，已体现在状态里
+            width, height, aggressive=True, danger_zone=set(),
+            check_space=False  # 搜索层不重复计算空间
         )
         if not my_safe:
             return -1000
@@ -325,7 +326,12 @@ def step_state(state, snake_id, new_head, width, height):
 # ─────────────────────────────────────────────
 
 def get_safe_moves(head, state, my_id, my_len, width, height,
-                   aggressive=True, danger_zone=None):
+                   aggressive=True, danger_zone=None, check_space=True):
+    """
+    check_space=True：对每个方向做 Flood Fill，
+    可达空间 < my_len 的方向视为死路，优先排除。
+    若所有方向都是死路，退回全部返回（总得挣扎）。
+    """
     if danger_zone is None:
         danger_zone = set()
     occupied = state["occupied"]
@@ -339,7 +345,6 @@ def get_safe_moves(head, state, my_id, my_len, width, height,
             continue
         if (nx, ny) in occupied:
             continue
-        # 危险区：高危格子直接跳过（只在根节点过滤，搜索层不过滤）
         if (nx, ny) in danger_zone:
             continue
 
@@ -352,13 +357,32 @@ def get_safe_moves(head, state, my_id, my_len, width, height,
                 if s["length"] >= my_len:
                     risky = True
                     break
-                # aggressive=True 时，比我短的蛇不算危险（攻击机会）
         if risky:
             continue
 
         safe[direction] = (nx, ny)
 
-    return safe
+    if not safe or not check_space:
+        return safe
+
+    # ── 空间下限过滤：Flood Fill < 蛇身长度 → 死路，排除 ──
+    # 注意：把我自己的尾部从 occupied 排除（尾部下回合移走，实际可走）
+    occupied_for_ff = occupied
+    for s in snakes:
+        if s["id"] == my_id and s["body"]:
+            tail = s["body"][-1]
+            tail_pos = (tail["x"], tail["y"])
+            occupied_for_ff = occupied - {tail_pos}
+            break
+
+    spacious = {}
+    for direction, pos in safe.items():
+        space = flood_fill(pos[0], pos[1], width, height, occupied_for_ff, max_cells=my_len * 2 + 10)
+        if space >= my_len:
+            spacious[direction] = pos
+
+    # 若过滤后没有方向，退回所有安全方向（总比撞墙好）
+    return spacious if spacious else safe
 
 
 # ─────────────────────────────────────────────
@@ -395,17 +419,45 @@ def evaluate(state, me, food, width, height):
     ff = flood_fill(my_pos[0], my_pos[1], width, height, occupied, max_cells=100)
     ff_score = ff / (width * height)
 
-    # ③ 食物分（血量动态权重叠加）
+    # ③ 食物分（血量动态权重 + 食物竞争 + 食物安全性）
     health_w  = max(0.5, (100 - health) / 50.0)
     food_list = list(state["food_set"])
+    food_score = 0.0
+    enemies = [s for s in snakes if s["id"] != my_id]
     if food_list:
-        min_fd = min(manhattan(my_pos, f) for f in food_list)
-        food_score = 1.0 / (1 + min_fd)
-    else:
-        food_score = 0.0
+        # 找离我最近的食物
+        nearest_food = min(food_list, key=lambda f: manhattan(my_pos, f))
+        my_food_dist = manhattan(my_pos, nearest_food)
+
+        # 食物竞争：看有没有敌蛇比我更近（或等距但比我长）
+        food_is_contested = False
+        food_is_dangerous = False
+        for s in enemies:
+            e_head = (s["head"]["x"], s["head"]["y"])
+            e_food_dist = manhattan(e_head, nearest_food)
+            if e_food_dist <= my_food_dist:
+                food_is_contested = True   # 敌蛇抢食
+            # 食物旁边有大蛇头（食物在危险区）
+            if manhattan(e_head, nearest_food) <= 1 and s["length"] >= my_len:
+                food_is_dangerous = True
+
+        base_food = 1.0 / (1 + my_food_dist)
+        if food_is_dangerous:
+            base_food *= 0.1   # 食物是陷阱，强力降权
+        elif food_is_contested:
+            base_food *= 0.5   # 有竞争，降权
+
+        # 吃食安全性：模拟走向食物后 Flood Fill 是否还够
+        if my_food_dist <= 3:  # 只在食物很近时检查
+            sim_len = my_len + 1  # 吃了食物蛇身+1
+            food_ff = flood_fill(nearest_food[0], nearest_food[1],
+                                  width, height, occupied, max_cells=sim_len * 2)
+            if food_ff < sim_len:
+                base_food *= 0.2   # 吃完会被困，强力降权
+
+        food_score = base_food
 
     # ④ 长度优势
-    enemies = [s for s in snakes if s["id"] != my_id]
     if enemies:
         nearest = min(enemies, key=lambda s: manhattan(
             my_pos, (s["head"]["x"], s["head"]["y"])
