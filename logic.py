@@ -86,16 +86,19 @@ def choose_move(data: dict) -> str:
         if move:
             best_move = move
 
-    # 食物兜底：以下任一条件触发强制找食
-    #   1. 短蛇（< 8）：始终优先找食
-    #   2. 任意长度血量 < 40：快饿死了，必须找食
-    #   3. 任意长度血量 < 60 且地图上只剩 ≤ 2 个食物：食物稀缺，提前抢
+    # 食物兜底：连续判断 + 极端危机硬兜底
+    #   正常情况由 Minimax 的连续 health_w 曲线处理
+    #   两种情况强制兜底：
+    #     1. 短蛇（< 8）：始终优先找食
+    #     2. 真实危机：最近食物的步数 >= 当前血量（不兜底必死）
+    #     3. 极端：血量 < 20
     health     = me["health"]
-    food_count = len(food)
+    my_head_pos = state["my_head"]
+    min_food_dist = min((manhattan(my_head_pos, f) for f in food), default=999) if food else 999
     force_food = (
         me["length"] < 8
-        or health < 40
-        or (health < 60 and food_count <= 2)
+        or health <= 25                               # 血量极低直接兜底
+        or (food and min_food_dist >= health - 5)    # 步数快追不上血量了
     )
     if force_food and food:
         food_move = _best_food_move(my_safe, food, state, width, height, me["length"])
@@ -492,15 +495,16 @@ def evaluate(state, me, food, width, height):
     ff_score = ff / (width * height)
 
     # ③ 食物分（每个食物独立评估，选最优安全食物）
-    # 血量权重：短蛇始终积极（最低0.8），血量越低越急
+    # health_w：连续曲线，血量越低食物权重越高，平滑过渡无跳变
+    #   urgency = (100 - health) / 100  ∈ [0, 1]
+    #   health_w = base * (1 + k * urgency²)
+    #   短蛇 base=1.2，其他 base=0.6；k=3 让低血时权重显著放大
+    urgency = (100 - health) / 100.0          # 0(满血) → 1(快死)
+    urgency = max(0.0, min(1.0, urgency))     # 限制在[0,1]
     if my_len < 8:
-        health_w = max(0.8, (120 - health) / 50.0)  # 短蛇：血量权重恒高
-    elif health < 40:
-        health_w = 3.0   # 任意长度快饿死：食物权重爆炸
-    elif health < 60:
-        health_w = 1.8   # 血量偏低：食物权重明显提升
+        health_w = 1.2 * (1 + 3 * urgency ** 2)  # 短蛇：最低1.2，最高4.2
     else:
-        health_w = max(0.5, (100 - health) / 50.0)
+        health_w = 0.6 * (1 + 3 * urgency ** 2)  # 其他：最低0.6，最高2.1
 
     food_list  = list(state["food_set"])
     enemies    = [s for s in snakes if s["id"] != my_id]
