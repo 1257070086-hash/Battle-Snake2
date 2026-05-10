@@ -61,14 +61,17 @@ def choose_move(data: dict) -> str:
     safe = sort_by_ff(safe, state["occupied"], width, height)
 
     # ── 血量紧急：直接贪心走向最近安全食物，不经过 Minimax ──────
-    # 这是唯一的食物逻辑，只在"不吃就死"时激活
+    # health < 60：比对手短时主动找食物发育；< 35：快死了必须吃
     health = me["health"]
-    if health < 35 and state["food_set"]:
+    snakes_alive = board["snakes"]
+    max_enemy_len = max((s["length"] for s in snakes_alive if s["id"] != me["id"]), default=0)
+    need_grow = (my_len := state["my_length"]) <= max_enemy_len  # 比对手短
+    urgent = health < 35 or (health < 60 and need_grow)
+    if urgent and state["food_set"]:
         nearest_food = min(
             state["food_set"],
             key=lambda f: manhattan(state["my_head"], f)
         )
-        # 在安全走法里选一个最靠近食物的方向
         best_food_mv = min(
             safe.items(),
             key=lambda kv: manhattan(kv[1], nearest_food)
@@ -148,9 +151,15 @@ def alphabeta(state, depth, alpha, beta, is_maximizing,
 
         val = float("-inf")
         for _, my_next in safe.items():
-            ns  = step_state(state, me_id, my_next, width, height)
-            val = max(val, alphabeta(ns, depth - 1, alpha, beta,
-                                     False, me_id, width, height, start))
+            ns = step_state(state, me_id, my_next, width, height)
+            # 吃食物即时奖励：Minimax 内部感知到"吃了变长"的价值
+            # 短蛇发育奖励大，长蛇吃食物奖励小
+            ate_bonus = 0
+            if ns.get("my_just_ate"):
+                ate_bonus = max(0, 20 - ns["my_length"] * 1)
+            child = alphabeta(ns, depth - 1, alpha, beta,
+                              False, me_id, width, height, start)
+            val = max(val, child + ate_bonus)
             alpha = max(alpha, val)
             if val >= beta:
                 break
@@ -218,7 +227,12 @@ def evaluate(state, me_id, width, height):
     if en_ff_avg < 1:
         return 10000
 
-    return my_ff - en_ff_avg
+    # 长度优势：比对手长 = 头对头安全 + 切割能力更强
+    # 每长一格约等于 2 格空间优势（经验值，可调）
+    max_enemy_len = max(s["length"] for s in enemies)
+    len_bonus = (my_len - max_enemy_len) * 2
+
+    return my_ff - en_ff_avg + len_bonus
 
 
 # ─────────────────────────────────────────────────────────────
@@ -302,6 +316,7 @@ def step_state(state, snake_id, new_head, width, height):
     new_my_head   = state["my_head"]
     new_my_length = state["my_length"]
     new_my_health = state["my_health"]
+    new_my_ate    = False
 
     for s in state["live_snakes"]:
         body  = list(s["body"])
@@ -323,6 +338,7 @@ def step_state(state, snake_id, new_head, width, height):
                 new_my_head   = new_head
                 new_my_length = new_s["length"]
                 new_my_health = new_s["health"]
+                new_my_ate    = ate
         else:
             # 对手蛇：尾部出队（尾部肯定移走）
             en_just_ate = (len(body) >= 2
@@ -354,6 +370,7 @@ def step_state(state, snake_id, new_head, width, height):
         "my_head":     new_my_head,
         "my_length":   new_my_length,
         "my_health":   new_my_health,
+        "my_just_ate": new_my_ate,
         "live_snakes": new_snakes,
         "me_id":       state.get("me_id"),
     }
