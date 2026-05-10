@@ -226,15 +226,21 @@ def evaluate(state, me_id, width, height):
     max_enemy_len = max((s["length"] for s in enemies), default=0)
 
     # 阶段权重
-    # 短蛇：Voronoi 没意义（地图大，身体短），纯靠吃食物发育
+    # 短蛇：Voronoi 没意义（地图大，身体短），靠食物发育 + 中心偏置防角落
     # 中蛇：食物和地盘并重
     # 长蛇：地盘主导
     if my_len < 7:
-        w_voronoi, w_food_base = 0.0, 8.0   # 短蛇：不看 Voronoi，纯追食物
+        w_voronoi, w_food_base, w_center = 0.0, 8.0, 1.5
     elif my_len < 13:
-        w_voronoi, w_food_base = 2.0, 3.0   # 中蛇：并重
+        w_voronoi, w_food_base, w_center = 2.0, 3.0, 0.5
     else:
-        w_voronoi, w_food_base = 4.0, 1.0   # 长蛇：地盘主导
+        w_voronoi, w_food_base, w_center = 4.0, 1.0, 0.0
+
+    # 中心偏置：离地图中心越近越好（防止角落困死）
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    max_dist = cx + cy
+    dist_center = abs(my_pos[0] - cx) + abs(my_pos[1] - cy)
+    center_score = 1.0 - (dist_center / max_dist)  # 0（角落）~ 1（中心）
 
     # 需求判断：血低或比对手短 → 放大食物权重
     need_food  = (health < 40) or (my_len <= max_enemy_len + 1)
@@ -243,7 +249,7 @@ def evaluate(state, me_id, width, height):
     best_food_score = 0.0
     for f in state["food_set"]:
         dist = manhattan(my_pos, f)
-        # 线性衰减（比指数更缓，远处食物也有足够引力）
+        # 线性衰减（比指数更缓，远处食物也有引力）
         base = max(0.0, 1.0 - dist * 0.08)
         # 食物被大蛇包围 → 降权
         for s in enemies:
@@ -255,7 +261,7 @@ def evaluate(state, me_id, width, height):
 
     food_score = best_food_score * food_weight
 
-    return voronoi_diff * w_voronoi + food_score
+    return voronoi_diff * w_voronoi + food_score + center_score * w_center
 
 
 # ─────────────────────────────────────────────
