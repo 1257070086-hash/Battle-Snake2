@@ -200,8 +200,17 @@ def alphabeta(state, depth, alpha, beta, is_maximizing,
 
 
 # ─────────────────────────────────────────────
-# 估值函数（精简：仅 voronoi_diff + food_score）
+# 估值函数 v8.0 — 核心：压缩对手空间
 # ─────────────────────────────────────────────
+#
+# 策略：
+#   我走完这步后，对手的 flood fill 缩小了多少？
+#   缩小越多 = 我越成功切割对手空间 = 越好
+#
+# 三个正交指标：
+#   1. space_score  = (我的ff - 对手ff) / 总格子     [生存 + 压迫]
+#   2. food_score   = 最近食物引力，阶段权重          [发育]
+#   3. center_score = 离中心越近越好（短蛇防角落死）  [仅短蛇期]
 
 def evaluate(state, me_id, width, height):
     my_pos   = state["my_head"]
@@ -210,47 +219,50 @@ def evaluate(state, me_id, width, height):
     occupied = state["occupied"]
     snakes   = state["live_snakes"]
 
-    # ① 死局硬截断
-    # 用完整 flood fill（不限制 max_cells）更准确判断能否存活
+    # ── ① 我的 flood fill（生存判断）────────────────────────────────
     my_ff = flood_fill(my_pos[0], my_pos[1], width, height, occupied)
     if my_ff < my_len:
-        return -1000
+        return -1000  # 死局
 
-    # ② Voronoi 差值（主导指标）
-    voronoi_mine, voronoi_total = voronoi_control(state, me_id, width, height)
-    voronoi_enemy = voronoi_total - voronoi_mine
-    voronoi_diff = (voronoi_mine - voronoi_enemy) / max(voronoi_total, 1)
-
-    # ③ 食物分（阶段权重）
-    enemies = [s for s in snakes if s["id"] != me_id]
+    # ── ② 核心：空间对比（我的 ff vs 对手的 ff 之和）──────────────
+    enemies = [s for s in snakes if s["id"] != me_id and s["health"] > 0]
     max_enemy_len = max((s["length"] for s in enemies), default=0)
 
-    # 阶段权重
-    # 短蛇：Voronoi 没意义（地图大，身体短），靠食物发育 + 中心偏置防角落
-    # 中蛇：食物和地盘并重
-    # 长蛇：地盘主导
-    if my_len < 7:
-        w_voronoi, w_food_base, w_center = 0.0, 8.0, 1.5
-    elif my_len < 13:
-        w_voronoi, w_food_base, w_center = 2.0, 3.0, 0.5
+    total_cells = width * height
+    if enemies:
+        # 所有对手 ff 的总和（代表对手总可用空间）
+        enemy_ff_sum = sum(
+            flood_fill(s["head"]["x"], s["head"]["y"], width, height, occupied,
+                       max_cells=total_cells)
+            for s in enemies
+        )
+        # 归一化：我的空间优势 = (我的ff - 对手ff均值) / 总格子
+        # 正数=我比对手活得更开，负数=我被压制
+        avg_enemy_ff = enemy_ff_sum / len(enemies)
+        space_score = (my_ff - avg_enemy_ff) / total_cells
     else:
-        w_voronoi, w_food_base, w_center = 4.0, 1.0, 0.0
+        # 无对手：只看我自己的空间比例
+        space_score = my_ff / total_cells
 
-    # 中心偏置：离地图中心越近越好（防止角落困死）
-    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
-    max_dist = cx + cy
-    dist_center = abs(my_pos[0] - cx) + abs(my_pos[1] - cy)
-    center_score = 1.0 - (dist_center / max_dist)  # 0（角落）~ 1（中心）
+    # ── ③ 阶段权重 ────────────────────────────────────────────────
+    # 短蛇：专注发育（追食物 + 防角落），不做空间压迫
+    # 中蛇：开始压迫（空间 + 食物并重）
+    # 长蛇：纯压迫（空间主导）
+    if my_len < 7:
+        w_space, w_food_base, w_center = 1.5, 6.0, 2.0
+    elif my_len < 13:
+        w_space, w_food_base, w_center = 3.0, 2.5, 0.5
+    else:
+        w_space, w_food_base, w_center = 5.0, 1.0, 0.0
 
-    # 需求判断：血低或比对手短 → 放大食物权重
+    # ── ④ 食物分 ──────────────────────────────────────────────────
     need_food  = (health < 40) or (my_len <= max_enemy_len + 1)
-    food_weight = w_food_base * (2.0 if need_food else 0.8)
+    food_weight = w_food_base * (2.0 if need_food else 0.6)
 
     best_food_score = 0.0
     for f in state["food_set"]:
         dist = manhattan(my_pos, f)
-        # 线性衰减（比指数更缓，远处食物也有引力）
-        base = max(0.0, 1.0 - dist * 0.08)
+        base = max(0.0, 1.0 - dist * 0.08)   # 线性衰减，12步外=0
         # 食物被大蛇包围 → 降权
         for s in enemies:
             eh = (s["head"]["x"], s["head"]["y"])
@@ -261,7 +273,15 @@ def evaluate(state, me_id, width, height):
 
     food_score = best_food_score * food_weight
 
-    return voronoi_diff * w_voronoi + food_score + center_score * w_center
+    # ── ⑤ 中心偏置（仅短蛇期，防角落死）─────────────────────────
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    max_dist = cx + cy
+    dist_center = abs(my_pos[0] - cx) + abs(my_pos[1] - cy)
+    center_score = 1.0 - (dist_center / max_dist)
+
+    return (space_score  * w_space
+            + food_score
+            + center_score * w_center)
 
 
 # ─────────────────────────────────────────────
