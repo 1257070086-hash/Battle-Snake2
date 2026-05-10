@@ -16,11 +16,13 @@ MAX_TRACKED_ENEMIES = 2
 BEAM_SIZE = 16
 DEADLINE_BUDGET = 0.40
 
-# ==================== 全局诊断统计 ====================
+
+# ==================== 诊断 ====================
 
 GAME_STATS = {
     "games": {},
     "depth_hist": Counter(),
+    "death_causes": Counter(),
 }
 
 
@@ -95,21 +97,14 @@ def in_bounds(p, w, h):
 # ==================== Make / Unmake ====================
 
 def apply_moves(st: GameState, moves: dict):
-    diff = {
-        "turn": st.turn,
-        "pre_move_snapshot": {},
-        "per_snake": {},
-        "killed": [],
-    }
+    diff = {"turn": st.turn, "pre_move_snapshot": {}, "per_snake": {}, "killed": []}
 
     for s in st.alive_snakes():
         if s.id not in moves:
             continue
         diff["pre_move_snapshot"][s.id] = {
-            "body": list(s.body),
-            "health": s.health,
-            "length": s.length,
-            "just_ate": s.just_ate,
+            "body": list(s.body), "health": s.health,
+            "length": s.length, "just_ate": s.just_ate,
         }
 
     new_heads = {}
@@ -123,7 +118,6 @@ def apply_moves(st: GameState, moves: dict):
 
         s.body.appendleft(new_head)
         s.health -= 1
-
         per_snap = {"added_head": new_head, "ate_food": False}
 
         if new_head in st.food:
@@ -141,8 +135,7 @@ def apply_moves(st: GameState, moves: dict):
     body_segs = set()
     for s in st.alive_snakes():
         for i, seg in enumerate(s.body):
-            if i == 0:
-                continue
+            if i == 0: continue
             body_segs.add(seg)
 
     killed_ids = set()
@@ -160,8 +153,7 @@ def apply_moves(st: GameState, moves: dict):
             killed_ids.add(sid); continue
 
     for h, ids in head_count.items():
-        if len(ids) < 2:
-            continue
+        if len(ids) < 2: continue
         lengths = [(sid, st.get_snake(sid).length) for sid in ids]
         max_len = max(L for _, L in lengths)
         max_count = sum(1 for _, L in lengths if L == max_len)
@@ -175,12 +167,10 @@ def apply_moves(st: GameState, moves: dict):
         s.alive = False
 
     st.turn += 1
-
     st.occupied = {}
     for s in st.alive_snakes():
         for seg in s.body:
             st.occupied[seg] = s.id
-
     st.undo_stack.append(diff)
 
 
@@ -224,6 +214,10 @@ def legal_moves_for(st: GameState, snake: Snake):
         owner = st.get_snake(owner_id)
         if owner is None or not owner.alive:
             out.append(name); continue
+        # 踩到别蛇头：对头碰撞，允许（由碰撞判定处理）
+        if nxt == owner.body[0] and owner.id != snake.id:
+            out.append(name); continue
+        # 即将移走的尾巴
         if (not owner.just_ate) and len(owner.body) > 1 and nxt == owner.body[-1]:
             out.append(name)
     return out
@@ -232,22 +226,17 @@ def legal_moves_for(st: GameState, snake: Snake):
 # ==================== 评估辅助 ====================
 
 def flood_fill_from(start, st: GameState, limit=None):
-    if not in_bounds(start, st.w, st.h):
-        return 0
-    if start in st.occupied:
-        return 0
+    if not in_bounds(start, st.w, st.h): return 0
+    if start in st.occupied: return 0
     seen = {start}
     q = deque([start])
     while q:
-        if limit and len(seen) >= limit:
-            break
+        if limit and len(seen) >= limit: break
         cur = q.popleft()
         for dx, dy in DIR_VECS:
             nxt = (cur[0] + dx, cur[1] + dy)
-            if nxt in seen or not in_bounds(nxt, st.w, st.h):
-                continue
-            if nxt in st.occupied:
-                continue
+            if nxt in seen or not in_bounds(nxt, st.w, st.h): continue
+            if nxt in st.occupied: continue
             seen.add(nxt); q.append(nxt)
     return len(seen)
 
@@ -264,18 +253,14 @@ def voronoi_areas(st: GameState):
 
     while q:
         (x, y), step, sid, length = q.popleft()
-        if sid is NEUTRAL:
-            continue
-        if dist.get((x, y)) != (step, sid, length):
-            continue
+        if sid is NEUTRAL: continue
+        if dist.get((x, y)) != (step, sid, length): continue
         if step > 0:
             areas[sid] = areas.get(sid, 0) + 1
         for dx, dy in DIR_VECS:
             nxt = (x + dx, y + dy)
-            if not in_bounds(nxt, st.w, st.h):
-                continue
-            if nxt in st.occupied:
-                continue
+            if not in_bounds(nxt, st.w, st.h): continue
+            if nxt in st.occupied: continue
             new_step = step + 1
             old = dist.get(nxt)
             if old is None:
@@ -291,8 +276,7 @@ def voronoi_areas(st: GameState):
 
 
 def food_distance_score(st: GameState, head):
-    if not st.food:
-        return 0.0
+    if not st.food: return 0.0
     max_dist = st.w + st.h
 
     seen = {head}
@@ -301,14 +285,11 @@ def food_distance_score(st: GameState, head):
         (x, y), d = q.popleft()
         if (x, y) in st.food and (x, y) != head:
             return 1.0 - d / max_dist
-        if d >= max_dist:
-            continue
+        if d >= max_dist: continue
         for dx, dy in DIR_VECS:
             nxt = (x + dx, y + dy)
-            if nxt in seen or not in_bounds(nxt, st.w, st.h):
-                continue
-            if nxt in st.occupied:
-                continue
+            if nxt in seen or not in_bounds(nxt, st.w, st.h): continue
+            if nxt in st.occupied: continue
             seen.add(nxt); q.append((nxt, d + 1))
 
     md = min(abs(head[0] - fx) + abs(head[1] - fy) for fx, fy in st.food)
@@ -317,20 +298,37 @@ def food_distance_score(st: GameState, head):
 
 def head_collision_threat(st: GameState, me: Snake) -> float:
     my_head = me.body[0]
+    my_zone = {my_head}
+    for dx, dy in DIR_VECS:
+        nb = (my_head[0] + dx, my_head[1] + dy)
+        if in_bounds(nb, st.w, st.h):
+            my_zone.add(nb)
+
     threat = 0.0
     hunt = 0.0
     for s in st.alive_snakes():
-        if s.id == me.id:
-            continue
+        if s.id == me.id: continue
         eh = s.body[0]
-        d = abs(my_head[0] - eh[0]) + abs(my_head[1] - eh[1])
-        if s.length >= me.length:
-            if d == 1: threat = min(threat, -1.0)
-            elif d == 2: threat = min(threat, -0.4)
-            elif d == 3: threat = min(threat, -0.15)
-        else:
-            if d == 1: hunt = max(hunt, 0.5)
-            elif d == 2: hunt = max(hunt, 0.2)
+        enemy_next = set()
+        for dx, dy in DIR_VECS:
+            nb = (eh[0] + dx, eh[1] + dy)
+            if in_bounds(nb, st.w, st.h):
+                enemy_next.add(nb)
+
+        if my_head in enemy_next:
+            if s.length >= me.length:
+                threat = min(threat, -1.0)
+            else:
+                hunt = max(hunt, 0.6)
+            continue
+
+        overlap = my_zone & enemy_next
+        overlap_count = len(overlap) - (1 if my_head in overlap else 0)
+        if overlap_count > 0 and s.length >= me.length:
+            threat = min(threat, -0.3 * overlap_count)
+        elif overlap_count > 0:
+            hunt = max(hunt, 0.15 * overlap_count)
+
     return threat + hunt
 
 
@@ -347,14 +345,43 @@ def escape_routes(st: GameState, head) -> int:
     routes = 0
     for dx, dy in DIR_VECS:
         nb = (head[0] + dx, head[1] + dy)
-        if not in_bounds(nb, st.w, st.h):
-            continue
-        if nb in st.occupied:
-            continue
+        if not in_bounds(nb, st.w, st.h): continue
+        if nb in st.occupied: continue
         sp = flood_fill_from(nb, st, limit=6)
         if sp >= 5:
             routes += 1
     return routes
+
+
+# ==================== 动态食物权重 + 长度差 ====================
+
+def compute_food_weight(me: Snake, st: GameState, threat: float, routes: int,
+                        max_enemy_len: int) -> float:
+    health = me.health
+    if health < 30:    base = 1.5
+    elif health < 50:  base = 0.8
+    elif health < 75:  base = 0.4
+    else:              base = 0.2
+
+    if threat >= -0.05 and routes >= 2:
+        safety_mul = 1.8
+    elif threat >= -0.3 and routes >= 2:
+        safety_mul = 1.2
+    else:
+        safety_mul = 0.6
+
+    diff = me.length - max_enemy_len
+    if diff <= -2:        len_mul = 1.6
+    elif diff == -1:      len_mul = 1.3
+    elif diff <= 2:       len_mul = 1.0
+    else:                 len_mul = 0.5
+
+    return base * safety_mul * len_mul
+
+
+def length_advantage_score(me: Snake, max_enemy_len: int) -> float:
+    diff = me.length - max_enemy_len
+    return max(-1.0, min(1.0, diff / 5.0))
 
 
 # ==================== 评估函数 ====================
@@ -364,6 +391,9 @@ def evaluate(st: GameState):
     if me is None or me.health <= 0:
         return -10000.0
     head = me.body[0]
+
+    enemies = [s for s in st.alive_snakes() if s.id != st.me_id]
+    max_enemy_len = max((s.length for s in enemies), default=0)
 
     areas = voronoi_areas(st)
     my_area = areas.get(st.me_id, 0)
@@ -377,53 +407,46 @@ def evaluate(st: GameState):
         reach_score = min(reach / (me.length * 2), 1.0)
 
     food_score = food_distance_score(st, head)
-    if me.health < 30:    food_w = 1.5
-    elif me.health < 60:  food_w = 0.6
-    else:                 food_w = 0.2
 
     cx, cy = (st.w - 1) / 2, (st.h - 1) / 2
     max_cd = cx + cy
     center_score = 1.0 - (abs(head[0] - cx) + abs(head[1] - cy)) / max_cd
 
-    length_cap = st.w * st.h / 4
-    length_score = min(me.length / length_cap, 1.0)
-
-    enemies_alive = sum(1 for s in st.alive_snakes() if s.id != st.me_id)
-
+    enemies_alive = len(enemies)
     head_threat = head_collision_threat(st, me)
     boundary_score = boundary_penalty(st, head)
     routes = escape_routes(st, head)
     routes_score = (routes - 2) / 2.0
 
+    food_w = compute_food_weight(me, st, head_threat, routes, max_enemy_len)
+    length_adv = length_advantage_score(me, max_enemy_len)
+
     return (voronoi_score   * 2.5 +
             reach_score     * 2.0 +
             food_score      * food_w +
-            center_score    * 0.1 +
-            length_score    * 0.4 -
+            center_score    * 0.1 -
             enemies_alive   * 0.15 +
             head_threat     * 3.0 +
             boundary_score  * 1.0 +
-            routes_score    * 1.5)
+            routes_score    * 1.5 +
+            length_adv      * 1.2)
 
 
-# ==================== 对手自杀走法过滤 ====================
+# ==================== 对手自杀过滤 ====================
 
 def would_self_kill(st: GameState, snake: Snake, move: str) -> bool:
-    """只过滤撞墙、撞静态身体。对头不过滤——保持 Paranoid 悲观。"""
     d = DIRS[move]
     head = snake.body[0]
     nxt = (head[0] + d[0], head[1] + d[1])
-
     if not in_bounds(nxt, st.w, st.h):
         return True
-
     owner_id = st.occupied.get(nxt)
     if owner_id is not None:
         owner = st.get_snake(owner_id)
         if owner and owner.alive:
             if owner.just_ate or len(owner.body) <= 1:
                 return True
-            if nxt != owner.body[-1]:
+            if nxt != owner.body[-1] and nxt != owner.body[0]:
                 return True
     return False
 
@@ -434,23 +457,32 @@ def order_my_moves(st: GameState, me: Snake, moves: list):
     head = me.body[0]
     enemies = [s for s in st.alive_snakes() if s.id != me.id]
 
+    danger_next = set()
+    hunt_next = set()
+    for s in enemies:
+        eh = s.body[0]
+        for dx, dy in DIR_VECS:
+            nb = (eh[0] + dx, eh[1] + dy)
+            if not in_bounds(nb, st.w, st.h): continue
+            if s.length >= me.length:
+                danger_next.add(nb)
+            else:
+                hunt_next.add(nb)
+
     scored = []
     for m in moves:
         d = DIRS[m]
         nxt = (head[0] + d[0], head[1] + d[1])
-
         free = sum(1 for dd in DIR_VECS
                    if in_bounds((nxt[0] + dd[0], nxt[1] + dd[1]), st.w, st.h)
                    and (nxt[0] + dd[0], nxt[1] + dd[1]) not in st.occupied)
-
         risk = 0
-        for s in enemies:
-            eh = s.body[0]
-            dist = abs(nxt[0] - eh[0]) + abs(nxt[1] - eh[1])
-            if s.length >= me.length:
-                if dist == 0:   risk += 100
-                elif dist == 1: risk += 30
-        scored.append((free - risk, m))
+        bonus = 0
+        if nxt in danger_next:
+            risk += 100
+        if nxt in hunt_next and nxt not in danger_next:
+            bonus += 5
+        scored.append((free - risk + bonus, m))
     scored.sort(reverse=True)
     return [m for _, m in scored]
 
@@ -509,8 +541,10 @@ def enumerate_joint_with_beam(st: GameState, snakes: list, beam_size: int = BEAM
 def search(st, depth, alpha, beta, deadline, to_move):
     if time.monotonic() > deadline: raise TimeUp
     me = st.me()
-    if me is None: return -10000.0 - depth
-    if depth == 0: return evaluate(st)
+    if me is None:
+        return -10000.0 - depth
+    if depth == 0:
+        return evaluate(st)
 
     if to_move == "me":
         moves = legal_moves_for(st, me)
@@ -545,14 +579,13 @@ def search(st, depth, alpha, beta, deadline, to_move):
         return worst
 
 
-# ==================== choose_move（带诊断 log）====================
+# ==================== choose_move ====================
 
 def choose_move(data):
     start_t = time.monotonic()
     st = state_from_request(data)
     me = st.me()
     game_id = data.get("game", {}).get("id", "unknown")
-
     if me is None:
         return "up"
 
@@ -560,7 +593,7 @@ def choose_move(data):
     legal = legal_moves_for(st, me)
 
     if not legal:
-        log(f"[NO-LEGAL] game={game_id[:8]} turn={st.turn} health={me.health} len={me.length}")
+        log(f"[NO-LEGAL] game={game_id[:8]} turn={st.turn}")
         head = me.body[0]
         best, best_sp = "up", -1
         for n, d in DIRS.items():
@@ -594,27 +627,18 @@ def choose_move(data):
             break
 
     elapsed = time.monotonic() - start_t
-
     GAME_STATS["depth_hist"][depth_reached] += 1
-    n_snakes = len(st.alive_snakes())
+
     head = me.body[0]
     threat = head_collision_threat(st, me)
     routes = escape_routes(st, head)
-    log(f"[MOVE] game={game_id[:8]} turn={st.turn} "
-        f"snakes={n_snakes} hp={me.health} len={me.length} "
-        f"head=({head[0]},{head[1]}) move={best_move} "
-        f"depth={depth_reached} val={best_val:.2f} "
-        f"threat={threat:.2f} routes={routes} time={elapsed*1000:.0f}ms")
-
-    GAME_STATS["games"].setdefault(game_id, {"turns": 0})
-    GAME_STATS["games"][game_id]["turns"] = st.turn
-    GAME_STATS["games"][game_id]["last_state"] = {
-        "head": head,
-        "health": me.health,
-        "length": me.length,
-        "move": best_move,
-        "n_snakes": n_snakes,
-    }
+    enemies = [s for s in st.alive_snakes() if s.id != st.me_id]
+    max_en_len = max((s.length for s in enemies), default=0)
+    food_w = compute_food_weight(me, st, threat, routes, max_en_len)
+    log(f"[MOVE] g={game_id[:6]} t={st.turn} hp={me.health} "
+        f"len={me.length}(vs{max_en_len}) head=({head[0]},{head[1]}) "
+        f"move={best_move} d={depth_reached} val={best_val:.2f} "
+        f"thr={threat:.2f} rt={routes} fw={food_w:.2f} {elapsed*1000:.0f}ms")
 
     return best_move
 
@@ -629,7 +653,7 @@ def info():
         "color": "#1E90FF",
         "head": "default",
         "tail": "default",
-        "version": "10.3.0",
+        "version": "10.4.0",
     })
 
 
@@ -637,7 +661,7 @@ def info():
 def start():
     data = request.get_json()
     game_id = data["game"]["id"]
-    log(f"[START] game={game_id[:8]} you={data['you']['id'][:8]}")
+    log(f"[START] game={game_id[:8]}")
     GAME_STATS["games"][game_id] = {"turns": 0}
     return "ok"
 
@@ -652,56 +676,40 @@ def end():
     health = me["health"]
     length = me["length"]
     body = [(p["x"], p["y"]) for p in me["body"]]
-    w = data["board"]["width"]
-    h = data["board"]["height"]
+    w, h = data["board"]["width"], data["board"]["height"]
 
     cause = "UNKNOWN"
     detail = ""
-
     if not in_bounds(head, w, h):
-        cause = "A_WALL"
-        detail = f"head=({head[0]},{head[1]}) bounds=({w},{h})"
+        cause = "A_WALL"; detail = f"head=({head[0]},{head[1]})"
     elif health <= 0:
-        cause = "E_STARVED"
-        detail = f"health=0 turn={turn}"
+        cause = "E_STARVED"; detail = f"turn={turn}"
     else:
         my_body_segs = body[1:]
         if head in my_body_segs:
             cause = "B_SELF_BODY"
-            detail = f"head hit own body at ({head[0]},{head[1]})"
         else:
-            hit_enemy = False
+            hit = False
             for s in data["board"]["snakes"]:
                 if s["id"] == me["id"]: continue
                 eh = (s["head"]["x"], s["head"]["y"])
                 ebody = [(p["x"], p["y"]) for p in s["body"]]
                 if eh == head:
-                    if s["length"] >= length:
-                        cause = "D_HEAD_COLLISION"
-                        detail = f"vs snake({s['id'][:8]}) my_len={length} their_len={s['length']}"
-                    hit_enemy = True
-                    break
+                    cause = "D_HEAD_COLLISION"
+                    detail = f"my_len={length} their_len={s['length']}"
+                    hit = True; break
                 if head in ebody[1:]:
-                    cause = "C_ENEMY_BODY"
-                    detail = f"hit body of snake({s['id'][:8]})"
-                    hit_enemy = True
-                    break
-            if not hit_enemy and cause == "UNKNOWN":
+                    cause = "C_ENEMY_BODY"; hit = True; break
+            if not hit:
                 alive_others = [s for s in data["board"]["snakes"] if s["id"] != me["id"]]
                 if not alive_others:
-                    cause = "WIN"
-                    detail = "last snake standing"
+                    cause = "WIN"; detail = "last snake standing"
 
     log(f"[END] game={game_id[:8]} turn={turn} cause={cause} detail={detail} "
         f"final_len={length} final_hp={health}")
-
-    if "death_causes" not in GAME_STATS:
-        GAME_STATS["death_causes"] = Counter()
     GAME_STATS["death_causes"][cause] += 1
-
     log(f"[STATS] depth_hist={dict(GAME_STATS['depth_hist'])}")
     log(f"[STATS] death_causes={dict(GAME_STATS['death_causes'])}")
-
     return "ok"
 
 
@@ -717,5 +725,5 @@ def move():
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8000))
-    log(f"Battlesnake v10.3 starting on :{port}")
+    log(f"Battlesnake v10.4 starting on :{port}")
     app.run(host="0.0.0.0", port=port)
