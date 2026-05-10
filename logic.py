@@ -75,11 +75,26 @@ def choose_move(data: dict) -> str:
 # ─────────────────────────────────────────────
 
 def sort_by_space(moves: dict, state, width, height) -> dict:
-    occupied = state["occupied"]
+    """
+    走法排序：flood fill 为主，近距离食物加轻微加成。
+    目的是让 Alpha-Beta 优先搜索吃食物方向，但不强制选它。
+    """
+    occupied  = state["occupied"]
+    food_list = list(state["food_set"])
     scored = []
+
     for direction, pos in moves.items():
         ff = flood_fill(pos[0], pos[1], width, height, occupied, max_cells=60)
-        scored.append((direction, pos, ff))
+
+        # 近距离食物加成（只影响排序，Minimax 最终分数仍由 evaluate 决定）
+        food_bonus = 0
+        for f in food_list:
+            d = manhattan(pos, f)
+            if d == 0:   food_bonus = max(food_bonus, 20)  # 直接踩上食物
+            elif d == 1: food_bonus = max(food_bonus, 5)   # 距食物 1 步
+
+        scored.append((direction, pos, ff + food_bonus))
+
     scored.sort(key=lambda x: x[2], reverse=True)
     return {d: p for d, p, _ in scored}
 
@@ -122,8 +137,19 @@ def alphabeta(state, depth, alpha, beta, is_maximizing,
         value = float("-inf")
         for _, my_next in safe.items():
             new_state = step_state(state, me_id, my_next, width, height)
-            value = max(value, alphabeta(new_state, depth - 1, alpha, beta,
-                                         False, me_id, width, height, start_time))
+            # 吃食物即时奖励：每一层都累加，不仅叶子节点
+            ate_bonus = 0.0
+            if new_state.get("my_just_ate"):
+                my_len = new_state["my_length"]
+                if my_len <= 6:
+                    ate_bonus = 1.5
+                elif my_len <= 12:
+                    ate_bonus = 0.8
+                else:
+                    ate_bonus = 0.3
+            child_score = alphabeta(new_state, depth - 1, alpha, beta,
+                                    False, me_id, width, height, start_time)
+            value = max(value, child_score + ate_bonus)
             alpha = max(alpha, value)
             if value >= beta:
                 break
@@ -174,43 +200,66 @@ def evaluate(state, me_id, width, height):
     if my_ff < my_len:
         return -1000
 
+    # ① 吃食物奖励：使用 step_state 里记录的 my_just_ate 信号
+    just_ate_bonus = 0.0
+    if state.get("my_just_ate"):
+        if my_len < 6:
+            just_ate_bonus = 1.5
+        elif my_len < 12:
+            just_ate_bonus = 0.8
+        else:
+            just_ate_bonus = 0.3
+
     # ② Voronoi 差值 = (我的格子 - 对手格子) / 总格子
-    #    这才是真正的"空间可能性"：我能先到多少格，对手能先到多少格
     voronoi_mine, voronoi_total = voronoi_control(state, me_id, width, height)
     voronoi_enemy = voronoi_total - voronoi_mine
     voronoi_diff = (voronoi_mine - voronoi_enemy) / max(voronoi_total, 1)
 
-    # ③ 食物分（按需激活）
+    # ③ 食物分（Fix2 + Fix3）
     enemies = [s for s in snakes if s["id"] != me_id]
     max_enemy_len = max((s["length"] for s in enemies), default=0)
 
-    # 按需条件：血量低 或 比最长对手短
+    # Fix2：按长度阶段动态调整 voronoi/food 权重
+    # 短蛇时 Voronoi 意义小，食物发育优先；长蛇时反过来
+    if my_len < 6:
+        w_voronoi, w_food_base = 1.0, 4.0   # 超短蛇：疯狂发育
+    elif my_len < 12:
+        w_voronoi, w_food_base = 2.5, 2.5   # 中短蛇：并重
+    else:
+        w_voronoi, w_food_base = 4.0, 1.0   # 中长蛇：地盘主导
+
+    # 需求食物权重：血低或比对手短时放大
     need_food = (health < 40) or (my_len <= max_enemy_len + 1)
-    food_weight = 3.0 if need_food else 0.3
+    food_weight = w_food_base * (1.5 if need_food else 0.4)
 
-    food_score = 0.0
     food_list = list(state["food_set"])
-    if food_list and food_weight > 0.3:  # 不需要食物时不计算，节省性能
-        best = 0.0
-        for f in food_list:
-            dist = manhattan(my_pos, f)
-            score = 1.0 / (1 + dist)
+    best_need_score  = 0.0   # 需求导向食物分（受 need_food 影响）
+    proximity_bonus  = 0.0   # Fix3：近距离加成（顺便吃，不受 need_food 限制）
 
-            # 降权：食物被大蛇头包围（头对头陷阱）
-            for s in enemies:
-                eh = (s["head"]["x"], s["head"]["y"])
-                if manhattan(eh, f) <= 1 and s["length"] >= my_len:
-                    score *= 0.1  # 危险食物，强力降权
-                    break
+    for f in food_list:
+        dist = manhattan(my_pos, f)
+        base = 1.0 / (1 + dist)
 
-            best = max(best, score)
-        food_score = best
-    elif food_list:
-        # 不需要食物时给极小权重，避免完全忽视血量
-        dist = min(manhattan(my_pos, f) for f in food_list)
-        food_score = 1.0 / (1 + dist) * 0.1
+        # 降权：食物被大蛇头包围（头对头陷阱）
+        trapped = False
+        for s in enemies:
+            eh = (s["head"]["x"], s["head"]["y"])
+            if manhattan(eh, f) <= 1 and s["length"] >= my_len:
+                trapped = True
+                break
+        if trapped:
+            base *= 0.1
 
-    return voronoi_diff * 4.0 + food_score * food_weight
+        best_need_score = max(best_need_score, base)
+
+        # Fix3：近距离加成（1步=1.0，2步=0.5，3步≈0，独立于 need_food）
+        if dist <= 2 and not trapped:
+            bonus = (3 - dist) / 3.0 * 1.2
+            proximity_bonus = max(proximity_bonus, bonus)
+
+    food_score = best_need_score * food_weight + proximity_bonus
+
+    return voronoi_diff * w_voronoi + food_score + just_ate_bonus
 
 
 # ─────────────────────────────────────────────
@@ -288,6 +337,7 @@ def build_state(me, snakes, food, width, height):
         "my_head":     (me["head"]["x"], me["head"]["y"]),
         "my_length":   me["length"],
         "my_health":   me["health"],
+        "my_just_ate": False,
         "live_snakes": snakes,
         "me_id":       me["id"],
     }
@@ -308,6 +358,7 @@ def step_state(state, snake_id, new_head, width, height):
     new_my_head   = state["my_head"]
     new_my_length = state["my_length"]
     new_my_health = state["my_health"]
+    new_my_ate    = False
 
     for s in state["live_snakes"]:
         body = list(s["body"])
@@ -333,11 +384,23 @@ def step_state(state, snake_id, new_head, width, height):
                 new_my_head   = new_head
                 new_my_length = new_len
                 new_my_health = new_health
+                new_my_ate    = ate_food
         else:
-            # 其余蛇：不知道它走哪，但尾部会释放
-            # 保守处理：身体不变，但尾部释放（下一回合 occupied 更新）
+            # Fix1：对手蛇也模拟尾部出队
+            # 不知道对手走哪，但尾部肯定移走 → occupied 正确释放
+            # 这样 Minimax 里对手不再"静止"，Voronoi 计算更真实
+            old_body = list(s["body"])
+            just_ate_enemy = (len(old_body) >= 2 and
+                              old_body[0]["x"] == old_body[1]["x"] and
+                              old_body[0]["y"] == old_body[1]["y"])
+            if not just_ate_enemy and len(old_body) > 1:
+                new_body = old_body[:-1]  # 尾部出队
+            else:
+                new_body = old_body
             new_health = max(0, s["health"] - 1)
             new_s = dict(s)
+            new_s["body"]   = new_body
+            new_s["length"] = len(new_body)
             new_s["health"] = new_health
 
         # 死蛇移除
@@ -363,6 +426,7 @@ def step_state(state, snake_id, new_head, width, height):
         "my_head":     new_my_head,
         "my_length":   new_my_length,
         "my_health":   new_my_health,
+        "my_just_ate": new_my_ate,
         "live_snakes": new_snakes,
         "me_id":       state.get("me_id"),
     }
