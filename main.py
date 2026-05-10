@@ -14,7 +14,7 @@ def on_info():
         "color": "#1E90FF",
         "head": "default",
         "tail": "default",
-        "version": "10.1.0",
+        "version": "10.2.0",
     })
 
 
