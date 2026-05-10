@@ -228,11 +228,22 @@ def evaluate(state, me_id, width, height):
         return 10000
 
     # 长度优势：比对手长 = 头对头安全 + 切割能力更强
-    # 每长一格约等于 2 格空间优势（经验值，可调）
     max_enemy_len = max(s["length"] for s in enemies)
     len_bonus = (my_len - max_enemy_len) * 2
 
-    return my_ff - en_ff_avg + len_bonus
+    # 食物吸引：仅在"需要吃食物"时生效，不干扰主策略
+    # 需要吃 = 血量低 OR 比最短对手还短（发育落后）
+    health = state["my_health"]
+    food_bonus = 0.0
+    if state["food_set"] and (health < 60 or my_len <= max_enemy_len):
+        best_dist = min(manhattan(my_pos, f) for f in state["food_set"])
+        # 距离越近分越高，最近一格=10分，10步外=0
+        food_bonus = max(0.0, 10.0 - best_dist)
+        # 比对手短时双倍：发育优先
+        if my_len < max_enemy_len:
+            food_bonus *= 2.0
+
+    return my_ff - en_ff_avg + len_bonus + food_bonus
 
 
 # ─────────────────────────────────────────────────────────────
@@ -340,23 +351,26 @@ def step_state(state, snake_id, new_head, width, height):
                 new_my_health = new_s["health"]
                 new_my_ate    = ate
         else:
-            # 对手蛇：尾部出队（尾部肯定移走）
-            en_just_ate = (len(body) >= 2
-                           and body[0]["x"] == body[1]["x"]
-                           and body[0]["y"] == body[1]["y"])
+            # 对手蛇：不是被模拟推进的那条，保持 body 不变
+            # （minimize 节点里会用 step_state 正确推进 nearest enemy）
+            # 只扣血；body/length 保持，occupied 重建时尾部正常处理
+            en_head_pos = (body[0]["x"], body[0]["y"])
+            en_just_ate = en_head_pos in food_set
+            # 尾部：如果没吃食物就释放（正确模拟）
             new_body = body[:-1] if (not en_just_ate and len(body) > 1) else body
             new_s["body"]   = new_body
-            new_s["length"] = len(new_body)
+            # ⚠️ length 不从 new_body 长度算——保持原始 length，防止初始重叠缩水
+            new_s["length"] = s["length"]
             new_s["health"] = max(0, s["health"] - 1)
 
         if new_s["health"] <= 0:
             continue   # 死蛇移除
 
         # 重建 occupied（尾部不算）
+        # ate_flag：用蛇头是否在 food_set 判断（与上面保持一致，避免初始重叠误判）
         sb       = new_s["body"]
-        ate_flag = (len(sb) >= 2
-                    and sb[0]["x"] == sb[1]["x"]
-                    and sb[0]["y"] == sb[1]["y"])
+        sb_head  = (sb[0]["x"], sb[0]["y"])
+        ate_flag = sb_head in food_set   # 吃到食物 → 尾不移走
         for i, seg in enumerate(sb):
             if i == len(sb) - 1 and not ate_flag:
                 continue
