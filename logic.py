@@ -1,47 +1,42 @@
 """
-BattleSnake AI — logic.py v7.0
-架构：Minimax + Alpha-Beta + Voronoi 差值核心
+BattleSnake AI — logic.py v9.0
+================================
+核心策略：Flood Fill Minimax
 
-设计原则：
-  搜索更深，而不是 evaluate 更复杂。
-  evaluate 只保留 2 个正交指标，靠深度预见转圈/绕死/头对头。
+唯一目标：让 flood_fill(我的头) - flood_fill(对手的头) 最大化。
 
-evaluate 指标（精简）：
-  1. voronoi_diff   = (我的格子 - 对手格子) / 总格子  [主导，阶段权重 1~4]
-  2. food_score     = 最近安全食物，阶段权重 + 按需激活
-  3. survival       = 死局硬截断 -1000
+evaluate = my_ff - enemy_ff_avg
+  - my_ff 下降（被困） → 不走
+  - enemy_ff 下降（被压） → 去做
+  - 血快见底不吃食物 → 几步后死 → my_ff 归零 → 自然去吃
 
-Minimax 改进：
-  - 对手节点：枚举最近敌蛇的所有安全走法，step_state 更新其头部
-  - MAX_DEPTH = 8，迭代加深 2→4→6→8，用完 380ms
+没有 Voronoi、没有 food_score、没有 center_bias、没有权重互搏。
 """
 
 import time
 from collections import deque
 
 DIRECTIONS = {
-    "up":    (0,  1),
-    "down":  (0, -1),
-    "left":  (-1, 0),
-    "right": (1,  0),
+    "up":    ( 0,  1),
+    "down":  ( 0, -1),
+    "left":  (-1,  0),
+    "right": ( 1,  0),
 }
 DIR_LIST  = list(DIRECTIONS.values())
 OPPOSITES = {"up": "down", "down": "up", "left": "right", "right": "left"}
 
 MAX_DEPTH  = 8
-TIME_LIMIT = 0.380   # 秒，Railway 响应限制 500ms，留 120ms 余量
+TIME_LIMIT = 0.380   # Railway 500ms 限制，留 120ms 余量
+
+_last_move: dict = {}   # snake_id → 上一步方向（跨回合防 U 型回头）
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # 主入口
-# ─────────────────────────────────────────────
-
-# 全局：跨回合记住上一步方向，防 U 型回头
-_last_move: dict = {}
-
+# ─────────────────────────────────────────────────────────────
 
 def choose_move(data: dict) -> str:
-    start_time = time.time()
+    start = time.time()
 
     board  = data["board"]
     me     = data["you"]
@@ -53,298 +48,218 @@ def choose_move(data: dict) -> str:
     state = build_state(me, snakes, food, width, height)
     state["last_dir"] = _last_move.get(me["id"])
 
-    # 获取安全走法
-    safe = get_safe_moves(state["my_head"], state, me["id"], state["my_length"],
-                          width, height)
+    safe = get_safe_moves(state["my_head"], state, me["id"],
+                          state["my_length"], width, height)
     if not safe:
         return "up"
     if len(safe) == 1:
-        move = list(safe.keys())[0]
-        _last_move[me["id"]] = move
-        return move
+        mv = list(safe.keys())[0]
+        _last_move[me["id"]] = mv
+        return mv
 
-    # 走法排序（flood fill 大的先搜，Alpha-Beta 剪枝更高效）
-    safe = sort_by_space(safe, state, width, height)
+    # flood fill 排序：大的先搜，Alpha-Beta 剪枝更高效
+    safe = sort_by_ff(safe, state["occupied"], width, height)
 
-    # 迭代加深 Minimax
-    best_move = list(safe.keys())[0]
-    for depth in range(2, MAX_DEPTH + 1, 2):   # 2, 4, 6, 8
-        if time.time() - start_time > TIME_LIMIT * 0.8:
+    # ── 血量紧急：直接贪心走向最近安全食物，不经过 Minimax ──────
+    # 这是唯一的食物逻辑，只在"不吃就死"时激活
+    health = me["health"]
+    if health < 35 and state["food_set"]:
+        nearest_food = min(
+            state["food_set"],
+            key=lambda f: manhattan(state["my_head"], f)
+        )
+        # 在安全走法里选一个最靠近食物的方向
+        best_food_mv = min(
+            safe.items(),
+            key=lambda kv: manhattan(kv[1], nearest_food)
+        )
+        _last_move[me["id"]] = best_food_mv[0]
+        return best_food_mv[0]
+
+    best = list(safe.keys())[0]
+    for depth in range(2, MAX_DEPTH + 1, 2):     # 2 → 4 → 6 → 8
+        if time.time() - start > TIME_LIMIT * 0.75:
             break
-        move, _ = alphabeta_root(state, safe, me["id"], width, height,
-                                 depth, start_time)
-        if move:
-            best_move = move
+        mv, _ = alphabeta_root(state, safe, me["id"], width, height,
+                                depth, start)
+        if mv:
+            best = mv
 
-    _last_move[me["id"]] = best_move
-    return best_move
+    _last_move[me["id"]] = best
+    return best
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # 走法排序
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
-def sort_by_space(moves: dict, state, width, height) -> dict:
-    """flood fill 排序，近距离食物轻微加成（让 Alpha-Beta 优先搜食物方向）"""
-    occupied  = state["occupied"]
-    food_list = list(state["food_set"])
-    scored = []
+def sort_by_ff(moves: dict, occupied: set, width: int, height: int) -> dict:
+    def score(kv):
+        direction, (nx, ny) = kv
+        ff = flood_fill(nx, ny, width, height, occupied, max_cells=150)
+        # 同分时：离边界越远越好（最小 Chebyshev 距离到边）
+        edge_dist = min(nx, width-1-nx, ny, height-1-ny)
+        return (ff, edge_dist)   # ff 优先，同分时 edge_dist 打破平局
 
-    for direction, pos in moves.items():
-        ff = flood_fill(pos[0], pos[1], width, height, occupied, max_cells=60)
-        food_bonus = 0
-        for f in food_list:
-            d = manhattan(pos, f)
-            if d == 0:   food_bonus = max(food_bonus, 20)
-            elif d == 1: food_bonus = max(food_bonus, 5)
-        scored.append((direction, pos, ff + food_bonus))
-
-    scored.sort(key=lambda x: x[2], reverse=True)
-    return {d: p for d, p, _ in scored}
+    scored = sorted(moves.items(), key=score, reverse=True)
+    return dict(scored)
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Alpha-Beta Minimax
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
-def alphabeta_root(state, safe, me_id, width, height, depth, start_time):
-    best_move  = None
+def alphabeta_root(state, safe, me_id, width, height, depth, start):
+    best_mv    = None
     best_score = float("-inf")
     alpha = float("-inf")
     beta  = float("inf")
-
     last_dir = state.get("last_dir")
 
     for direction, my_next in safe.items():
-        if time.time() - start_time > TIME_LIMIT:
+        if time.time() - start > TIME_LIMIT:
             break
-        new_state = step_state(state, me_id, my_next, width, height)
-        score = alphabeta(new_state, depth - 1, alpha, beta, False,
-                          me_id, width, height, start_time)
+        ns = step_state(state, me_id, my_next, width, height)
+        sc = alphabeta(ns, depth - 1, alpha, beta, False,
+                       me_id, width, height, start)
 
-        # 回头惩罚：防 U 型来回
+        # 轻微回头惩罚（防 U 型往复，不影响真正好的回头）
         if last_dir and OPPOSITES.get(last_dir) == direction:
-            score -= 0.6
+            sc -= 3
 
-        if score > best_score:
-            best_score = score
-            best_move  = direction
+        if sc > best_score:
+            best_score = sc
+            best_mv    = direction
         alpha = max(alpha, best_score)
 
-    return best_move, best_score
+    return best_mv, best_score
 
 
 def alphabeta(state, depth, alpha, beta, is_maximizing,
-              me_id, width, height, start_time):
-    if depth == 0 or time.time() - start_time > TIME_LIMIT:
+              me_id, width, height, start):
+    if depth == 0 or time.time() - start > TIME_LIMIT:
         return evaluate(state, me_id, width, height)
 
     if is_maximizing:
-        safe = get_safe_moves(state["my_head"], state, me_id, state["my_length"],
-                              width, height)
+        safe = get_safe_moves(state["my_head"], state, me_id,
+                              state["my_length"], width, height)
         if not safe:
-            return -1000
+            return -10000   # 我死局
 
-        value = float("-inf")
+        val = float("-inf")
         for _, my_next in safe.items():
-            new_state = step_state(state, me_id, my_next, width, height)
-            # 吃食物即时奖励：每踩一次食物立刻加分，不管搜到哪层
-            # 这是让蛇"主动拐向食物"的关键——叶子节点的 food_score 不够强
-            ate_bonus = 0.0
-            if new_state.get("my_just_ate"):
-                my_l = new_state["my_length"]
-                if my_l <= 7:
-                    ate_bonus = 2.0    # 短蛇吃食物：极高奖励
-                elif my_l <= 13:
-                    ate_bonus = 1.0    # 中蛇
-                else:
-                    ate_bonus = 0.4    # 长蛇
-            child = alphabeta(new_state, depth - 1, alpha, beta,
-                              False, me_id, width, height, start_time)
-            value = max(value, child + ate_bonus)
-            alpha = max(alpha, value)
-            if value >= beta:
+            ns  = step_state(state, me_id, my_next, width, height)
+            val = max(val, alphabeta(ns, depth - 1, alpha, beta,
+                                     False, me_id, width, height, start))
+            alpha = max(alpha, val)
+            if val >= beta:
                 break
-        return value
+        return val
 
     else:
-        # 对手节点：找最近敌蛇，枚举其所有安全走法，取最坏情况
+        # 最近的活着的敌蛇
         enemies = [s for s in state["live_snakes"]
                    if s["id"] != me_id and s["health"] > 0]
         if not enemies:
             return alphabeta(state, depth - 1, alpha, beta, True,
-                             me_id, width, height, start_time)
+                             me_id, width, height, start)
 
         nearest = min(enemies, key=lambda s: manhattan(
             state["my_head"], (s["head"]["x"], s["head"]["y"])
         ))
         e_head = (nearest["head"]["x"], nearest["head"]["y"])
-        e_safe = get_safe_moves(e_head, state, nearest["id"], nearest["length"],
-                                width, height)
+        e_safe = get_safe_moves(e_head, state, nearest["id"],
+                                nearest["length"], width, height)
         if not e_safe:
-            # 对手无路可走，对我有利 → 继续我方节点
             return alphabeta(state, depth - 1, alpha, beta, True,
-                             me_id, width, height, start_time)
+                             me_id, width, height, start)
 
-        value = float("inf")
+        val = float("inf")
         for _, e_next in e_safe.items():
-            # ✅ 修复：对手走一步，更新其头部位置到 new_state
-            new_state = step_state(state, nearest["id"], e_next, width, height)
-            child = alphabeta(new_state, depth - 1, alpha, beta,
-                              True, me_id, width, height, start_time)
-            value = min(value, child)
-            beta = min(beta, value)
-            if value <= alpha:
+            ns  = step_state(state, nearest["id"], e_next, width, height)
+            val = min(val, alphabeta(ns, depth - 1, alpha, beta,
+                                      True, me_id, width, height, start))
+            beta = min(beta, val)
+            if val <= alpha:
                 break
-        return value
+        return val
 
 
-# ─────────────────────────────────────────────
-# 估值函数 v8.0 — 核心：压缩对手空间
-# ─────────────────────────────────────────────
-#
-# 策略：
-#   我走完这步后，对手的 flood fill 缩小了多少？
-#   缩小越多 = 我越成功切割对手空间 = 越好
-#
-# 三个正交指标：
-#   1. space_score  = (我的ff - 对手ff) / 总格子     [生存 + 压迫]
-#   2. food_score   = 最近食物引力，阶段权重          [发育]
-#   3. center_score = 离中心越近越好（短蛇防角落死）  [仅短蛇期]
+# ─────────────────────────────────────────────────────────────
+# 估值函数 — 唯一核心：my_ff - enemy_ff
+# ─────────────────────────────────────────────────────────────
 
 def evaluate(state, me_id, width, height):
-    my_pos   = state["my_head"]
-    my_len   = state["my_length"]
-    health   = state["my_health"]
-    occupied = state["occupied"]
-    snakes   = state["live_snakes"]
+    my_pos = state["my_head"]
+    my_len = state["my_length"]
+    occ    = state["occupied"]
 
-    # ── ① 我的 flood fill（生存判断）────────────────────────────────
-    my_ff = flood_fill(my_pos[0], my_pos[1], width, height, occupied)
+    # 我的可达空间
+    my_ff = flood_fill(my_pos[0], my_pos[1], width, height, occ)
+
+    # 我被困死 → 最坏
     if my_ff < my_len:
-        return -1000  # 死局
+        return -10000
 
-    # ── ② 核心：空间对比（我的 ff vs 对手的 ff 之和）──────────────
-    enemies = [s for s in snakes if s["id"] != me_id and s["health"] > 0]
-    max_enemy_len = max((s["length"] for s in enemies), default=0)
+    enemies = [s for s in state["live_snakes"]
+               if s["id"] != me_id and s["health"] > 0]
 
-    total_cells = width * height
-    if enemies:
-        # 所有对手 ff 的总和（代表对手总可用空间）
-        enemy_ff_sum = sum(
-            flood_fill(s["head"]["x"], s["head"]["y"], width, height, occupied,
-                       max_cells=total_cells)
-            for s in enemies
-        )
-        # 归一化：我的空间优势 = (我的ff - 对手ff均值) / 总格子
-        # 正数=我比对手活得更开，负数=我被压制
-        avg_enemy_ff = enemy_ff_sum / len(enemies)
-        space_score = (my_ff - avg_enemy_ff) / total_cells
-    else:
-        # 无对手：只看我自己的空间比例
-        space_score = my_ff / total_cells
+    if not enemies:
+        return my_ff   # 无对手，空间越大越好
 
-    # ── ③ 阶段权重 ────────────────────────────────────────────────
-    # 短蛇：专注发育（追食物 + 防角落），不做空间压迫
-    # 中蛇：开始压迫（空间 + 食物并重）
-    # 长蛇：纯压迫（空间主导）
-    if my_len < 7:
-        w_space, w_food_base, w_center = 1.5, 6.0, 2.0
-    elif my_len < 13:
-        w_space, w_food_base, w_center = 3.0, 2.5, 0.5
-    else:
-        w_space, w_food_base, w_center = 5.0, 1.0, 0.0
+    # 对手的可达空间（取平均，多蛇时不偏向某一条）
+    en_ff_total = sum(
+        flood_fill(s["head"]["x"], s["head"]["y"], width, height, occ)
+        for s in enemies
+    )
+    en_ff_avg = en_ff_total / len(enemies)
 
-    # ── ④ 食物分 ──────────────────────────────────────────────────
-    need_food  = (health < 40) or (my_len <= max_enemy_len + 1)
-    food_weight = w_food_base * (2.0 if need_food else 0.6)
+    # 对手全部被困死 → 最好
+    if en_ff_avg < 1:
+        return 10000
 
-    best_food_score = 0.0
-    for f in state["food_set"]:
-        dist = manhattan(my_pos, f)
-        base = max(0.0, 1.0 - dist * 0.08)   # 线性衰减，12步外=0
-        # 食物被大蛇包围 → 降权
-        for s in enemies:
-            eh = (s["head"]["x"], s["head"]["y"])
-            if manhattan(eh, f) <= 1 and s["length"] >= my_len:
-                base *= 0.1
-                break
-        best_food_score = max(best_food_score, base)
-
-    food_score = best_food_score * food_weight
-
-    # ── ⑤ 位置安全分（直接惩罚边缘和角落）─────────────────────────
-    # 边缘格：只有 2-3 个相邻格，更容易被困死
-    # 角落格：只有 2 个相邻格，最危险
-    x, y = my_pos
-    # 离最近边界的距离（0=在边上，1=距边1格，...）
-    edge_dist = min(x, width-1-x, y, height-1-y)
-    # 0=角落/边缘 → 1=中心区域，分段线性
-    if edge_dist == 0:
-        pos_score = 0.0    # 在边上
-    elif edge_dist == 1:
-        pos_score = 0.4    # 距边1格
-    elif edge_dist == 2:
-        pos_score = 0.7    # 距边2格
-    else:
-        pos_score = 1.0    # 内部安全区
-
-    return (space_score  * w_space
-            + food_score
-            + pos_score  * w_center)
+    return my_ff - en_ff_avg
 
 
-# ─────────────────────────────────────────────
-# 安全走法过滤（三层）
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 安全走法过滤（两层）
+# ─────────────────────────────────────────────────────────────
 
 def get_safe_moves(head, state, my_id, my_len, width, height):
-    occupied = state["occupied"]
-    snakes   = state["live_snakes"]
+    occ    = state["occupied"]
+    snakes = state["live_snakes"]
 
-    # 第一层：边界 + 蛇身（硬过滤）
+    # 第一层：边界 + 蛇身（硬过滤，不可妥协）
     layer1 = {}
     for direction, (dx, dy) in DIRECTIONS.items():
         nx, ny = head[0] + dx, head[1] + dy
         if nx < 0 or nx >= width or ny < 0 or ny >= height:
             continue
-        if (nx, ny) in occupied:
+        if (nx, ny) in occ:
             continue
         layer1[direction] = (nx, ny)
 
     if not layer1:
         return layer1
 
-    # 第二层：头对头危险（软过滤）
+    # 第二层：头对头危险（软过滤：全部危险时退回 layer1）
     layer2 = {}
     for direction, pos in layer1.items():
-        risky = False
-        for s in snakes:
-            if s["id"] == my_id:
-                continue
-            eh = (s["head"]["x"], s["head"]["y"])
-            if manhattan(pos, eh) == 1 and s["length"] >= my_len:
-                risky = True
-                break
+        risky = any(
+            s["id"] != my_id
+            and manhattan(pos, (s["head"]["x"], s["head"]["y"])) == 1
+            and s["length"] >= my_len
+            for s in snakes
+        )
         if not risky:
             layer2[direction] = pos
 
-    candidates = layer2 if layer2 else layer1
-
-    # 第三层：空间下限（软过滤）
-    spacious = {}
-    for direction, pos in candidates.items():
-        ff = flood_fill(pos[0], pos[1], width, height, occupied,
-                        max_cells=my_len * 2 + 5)
-        if ff >= my_len:
-            spacious[direction] = pos
-
-    return spacious if spacious else candidates
+    return layer2 if layer2 else layer1
 
 
-# ─────────────────────────────────────────────
-# 状态构建
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 状态构建与推进
+# ─────────────────────────────────────────────────────────────
 
 def build_state(me, snakes, food, width, height):
     food_set = set(food)
@@ -352,12 +267,13 @@ def build_state(me, snakes, food, width, height):
 
     for snake in snakes:
         body = snake["body"]
-        just_ate = (len(body) >= 2 and
-                    body[0]["x"] == body[1]["x"] and
-                    body[0]["y"] == body[1]["y"])
+        # 头尾重叠 = 上回合刚吃食物，尾部不收缩
+        just_ate = (len(body) >= 2
+                    and body[0]["x"] == body[1]["x"]
+                    and body[0]["y"] == body[1]["y"])
         for i, seg in enumerate(body):
             if i == len(body) - 1 and not just_ate:
-                continue  # 尾部下回合移走，不算障碍
+                continue   # 尾部下回合移走，不计入障碍
             occupied.add((seg["x"], seg["y"]))
 
     return {
@@ -366,7 +282,6 @@ def build_state(me, snakes, food, width, height):
         "my_head":     (me["head"]["x"], me["head"]["y"]),
         "my_length":   me["length"],
         "my_health":   me["health"],
-        "my_just_ate": False,
         "live_snakes": list(snakes),
         "me_id":       me["id"],
     }
@@ -375,124 +290,82 @@ def build_state(me, snakes, food, width, height):
 def step_state(state, snake_id, new_head, width, height):
     """
     推进一步：
-    - 目标蛇：头前进、尾出队、吃食物
-    - 其余蛇：尾部释放（保守假设它们也在移动）
+    - 目标蛇：头前进，判断吃食物，更新 body/health/length
+    - 其余蛇：尾部释放（保守模拟——它们也在移动）
+    - 死蛇移除
     """
-    food_set     = state["food_set"]
-    new_food     = set(food_set)
-    new_snakes   = []
-    new_occupied = set()
+    food_set    = state["food_set"]
+    new_food    = set(food_set)
+    new_occ     = set()
+    new_snakes  = []
 
     new_my_head   = state["my_head"]
     new_my_length = state["my_length"]
     new_my_health = state["my_health"]
-    new_my_ate    = False
 
     for s in state["live_snakes"]:
-        body = list(s["body"])
+        body  = list(s["body"])
         new_s = dict(s)
 
         if s["id"] == snake_id:
-            ate_food   = new_head in food_set
+            ate        = new_head in food_set
             new_body   = [{"x": new_head[0], "y": new_head[1]}] + body
-            if not ate_food:
+            if not ate:
                 new_body = new_body[:-1]
-            if ate_food:
+            if ate:
                 new_food.discard(new_head)
-            new_len    = len(new_body)
-            new_health = 100 if ate_food else max(0, s["health"] - 1)
-
             new_s["body"]   = new_body
             new_s["head"]   = {"x": new_head[0], "y": new_head[1]}
-            new_s["length"] = new_len
-            new_s["health"] = new_health
+            new_s["length"] = len(new_body)
+            new_s["health"] = 100 if ate else max(0, s["health"] - 1)
 
             if s["id"] == state.get("me_id"):
                 new_my_head   = new_head
-                new_my_length = new_len
-                new_my_health = new_health
-                new_my_ate    = ate_food
+                new_my_length = new_s["length"]
+                new_my_health = new_s["health"]
         else:
-            # 对手蛇：尾部出队（不知道它走哪，但尾部肯定移走）
-            just_ate_enemy = (len(body) >= 2 and
-                              body[0]["x"] == body[1]["x"] and
-                              body[0]["y"] == body[1]["y"])
-            new_body = body[:-1] if (not just_ate_enemy and len(body) > 1) else body
+            # 对手蛇：尾部出队（尾部肯定移走）
+            en_just_ate = (len(body) >= 2
+                           and body[0]["x"] == body[1]["x"]
+                           and body[0]["y"] == body[1]["y"])
+            new_body = body[:-1] if (not en_just_ate and len(body) > 1) else body
             new_s["body"]   = new_body
             new_s["length"] = len(new_body)
             new_s["health"] = max(0, s["health"] - 1)
 
         if new_s["health"] <= 0:
-            continue
+            continue   # 死蛇移除
 
-        # 重建 occupied（尾部不算：下回合会移走）
-        s_body   = new_s["body"]
-        just_ate = (len(s_body) >= 2 and
-                    s_body[0]["x"] == s_body[1]["x"] and
-                    s_body[0]["y"] == s_body[1]["y"])
-        for i, seg in enumerate(s_body):
-            if i == len(s_body) - 1 and not just_ate:
+        # 重建 occupied（尾部不算）
+        sb       = new_s["body"]
+        ate_flag = (len(sb) >= 2
+                    and sb[0]["x"] == sb[1]["x"]
+                    and sb[0]["y"] == sb[1]["y"])
+        for i, seg in enumerate(sb):
+            if i == len(sb) - 1 and not ate_flag:
                 continue
-            new_occupied.add((seg["x"], seg["y"]))
+            new_occ.add((seg["x"], seg["y"]))
 
         new_snakes.append(new_s)
 
     return {
-        "occupied":    new_occupied,
+        "occupied":    new_occ,
         "food_set":    new_food,
         "my_head":     new_my_head,
         "my_length":   new_my_length,
         "my_health":   new_my_health,
-        "my_just_ate": new_my_ate,
         "live_snakes": new_snakes,
         "me_id":       state.get("me_id"),
     }
 
 
-# ─────────────────────────────────────────────
-# Voronoi 控制面积
-# ─────────────────────────────────────────────
-
-def voronoi_control(state, my_id, width, height):
-    """BFS 多源扩展，返回 (我的格子数, 总已分配格子数)"""
-    occupied = state["occupied"]
-    snakes   = state["live_snakes"]
-    owner    = {}
-    dist_map = {}
-    queue    = deque()
-
-    for s in snakes:
-        h = (s["head"]["x"], s["head"]["y"])
-        if h not in dist_map:
-            owner[h]    = s["id"]
-            dist_map[h] = 0
-            queue.append((h, s["id"]))
-
-    while queue:
-        (cx, cy), sid = queue.popleft()
-        d = dist_map[(cx, cy)]
-        for dx, dy in DIR_LIST:
-            nx, ny = cx + dx, cy + dy
-            if nx < 0 or nx >= width or ny < 0 or ny >= height:
-                continue
-            if (nx, ny) in occupied or (nx, ny) in dist_map:
-                continue
-            dist_map[(nx, ny)] = d + 1
-            owner[(nx, ny)]    = sid
-            queue.append(((nx, ny), sid))
-
-    mine  = sum(1 for sid in owner.values() if sid == my_id)
-    total = len(owner)
-    return mine, total
-
-
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # 工具函数
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
-def flood_fill(start_x, start_y, width, height, occupied, max_cells=300):
-    visited = {(start_x, start_y)}
-    queue   = deque([(start_x, start_y)])
+def flood_fill(sx, sy, width, height, occupied, max_cells=300):
+    visited = {(sx, sy)}
+    queue   = deque([(sx, sy)])
     while queue and len(visited) < max_cells:
         cx, cy = queue.popleft()
         for dx, dy in DIR_LIST:
