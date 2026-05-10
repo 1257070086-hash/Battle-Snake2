@@ -259,7 +259,13 @@ def evaluate(state, me_id, width, height):
 
     food_score = best_need_score * food_weight + proximity_bonus
 
-    return voronoi_diff * w_voronoi + food_score + just_ate_bonus
+    # ④ Mobility：我的头部下一步有几个合法方向
+    # 转圈的蛇会把自己逼入角落，mobility 天然下降
+    # 这是打破无记忆 Voronoi 转圈的关键
+    next_moves = get_safe_moves(my_pos, state, me_id, my_len, width, height)
+    mobility = len(next_moves) / 4.0  # 归一化 0~1，4个方向时=1.0
+
+    return voronoi_diff * w_voronoi + food_score + just_ate_bonus + mobility * 1.5
 
 
 # ─────────────────────────────────────────────
