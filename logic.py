@@ -148,9 +148,20 @@ def alphabeta(state, depth, alpha, beta, is_maximizing,
         value = float("-inf")
         for _, my_next in safe.items():
             new_state = step_state(state, me_id, my_next, width, height)
+            # 吃食物即时奖励：每踩一次食物立刻加分，不管搜到哪层
+            # 这是让蛇"主动拐向食物"的关键——叶子节点的 food_score 不够强
+            ate_bonus = 0.0
+            if new_state.get("my_just_ate"):
+                my_l = new_state["my_length"]
+                if my_l <= 7:
+                    ate_bonus = 2.0    # 短蛇吃食物：极高奖励
+                elif my_l <= 13:
+                    ate_bonus = 1.0    # 中蛇
+                else:
+                    ate_bonus = 0.4    # 长蛇
             child = alphabeta(new_state, depth - 1, alpha, beta,
                               False, me_id, width, height, start_time)
-            value = max(value, child)
+            value = max(value, child + ate_bonus)
             alpha = max(alpha, value)
             if value >= beta:
                 break
@@ -214,23 +225,27 @@ def evaluate(state, me_id, width, height):
     enemies = [s for s in snakes if s["id"] != me_id]
     max_enemy_len = max((s["length"] for s in enemies), default=0)
 
-    # 阶段权重：短蛇食物优先，长蛇地盘优先
-    if my_len < 6:
-        w_voronoi, w_food_base = 1.0, 4.0
-    elif my_len < 12:
-        w_voronoi, w_food_base = 2.5, 2.5
+    # 阶段权重
+    # 短蛇：Voronoi 没意义（地图大，身体短），纯靠吃食物发育
+    # 中蛇：食物和地盘并重
+    # 长蛇：地盘主导
+    if my_len < 7:
+        w_voronoi, w_food_base = 0.0, 8.0   # 短蛇：不看 Voronoi，纯追食物
+    elif my_len < 13:
+        w_voronoi, w_food_base = 2.0, 3.0   # 中蛇：并重
     else:
-        w_voronoi, w_food_base = 4.0, 1.0
+        w_voronoi, w_food_base = 4.0, 1.0   # 长蛇：地盘主导
 
     # 需求判断：血低或比对手短 → 放大食物权重
     need_food  = (health < 40) or (my_len <= max_enemy_len + 1)
-    food_weight = w_food_base * (1.5 if need_food else 0.4)
+    food_weight = w_food_base * (2.0 if need_food else 0.8)
 
     best_food_score = 0.0
     for f in state["food_set"]:
         dist = manhattan(my_pos, f)
-        base = 1.0 / (1 + dist)
-        # 食物被大蛇包围 → 降权（头对头陷阱）
+        # 线性衰减（比指数更缓，远处食物也有足够引力）
+        base = max(0.0, 1.0 - dist * 0.08)
+        # 食物被大蛇包围 → 降权
         for s in enemies:
             eh = (s["head"]["x"], s["head"]["y"])
             if manhattan(eh, f) <= 1 and s["length"] >= my_len:
