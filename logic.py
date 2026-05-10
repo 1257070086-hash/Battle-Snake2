@@ -34,6 +34,10 @@ TIME_LIMIT = 0.400   # 秒，超过 350ms 停止扩展
 # 主入口
 # ─────────────────────────────────────────────
 
+# 全局：记录上一步方向（简单状态，防止 U 型回头）
+_last_move: dict = {}  # snake_id -> direction str
+
+
 def choose_move(data: dict) -> str:
     start_time = time.time()
 
@@ -52,10 +56,15 @@ def choose_move(data: dict) -> str:
     if not safe:
         return "up"
     if len(safe) == 1:
-        return list(safe.keys())[0]
+        move = list(safe.keys())[0]
+        _last_move[me["id"]] = move
+        return move
 
     # 根节点走法排序：flood fill 大的方向先搜，Alpha-Beta 剪枝更高效
     safe = sort_by_space(safe, state, width, height)
+
+    # 注入上一步方向到 state，供 evaluate 里的回头惩罚使用
+    state["last_dir"] = _last_move.get(me["id"])
 
     # Minimax 迭代加深
     best_move = list(safe.keys())[0]
@@ -67,6 +76,7 @@ def choose_move(data: dict) -> str:
         if move:
             best_move = move
 
+    _last_move[me["id"]] = best_move
     return best_move
 
 
@@ -103,11 +113,16 @@ def sort_by_space(moves: dict, state, width, height) -> dict:
 # Alpha-Beta Minimax
 # ─────────────────────────────────────────────
 
+OPPOSITES = {"up": "down", "down": "up", "left": "right", "right": "left"}
+
+
 def alphabeta_root(state, safe, me_id, width, height, depth, start_time):
     best_move  = None
     best_score = float("-inf")
     alpha = float("-inf")
     beta  = float("inf")
+
+    last_dir = state.get("last_dir")  # 上一步走的方向
 
     for direction, my_next in safe.items():
         if time.time() - start_time > TIME_LIMIT:
@@ -115,6 +130,11 @@ def alphabeta_root(state, safe, me_id, width, height, depth, start_time):
         new_state = step_state(state, me_id, my_next, width, height)
         score = alphabeta(new_state, depth - 1, alpha, beta, False,
                           me_id, width, height, start_time)
+
+        # 回头惩罚：上步走 X，这步走反向 → 扣分（防 U 型回头转圈）
+        if last_dir and OPPOSITES.get(last_dir) == direction:
+            score -= 0.8
+
         if score > best_score:
             best_score = score
             best_move  = direction
@@ -196,9 +216,14 @@ def evaluate(state, me_id, width, height):
     snakes   = state["live_snakes"]
 
     # ① 死局硬截断（最高优先级）
-    my_ff = flood_fill(my_pos[0], my_pos[1], width, height, occupied, max_cells=my_len * 2)
+    my_ff = flood_fill(my_pos[0], my_pos[1], width, height, occupied, max_cells=my_len * 4)
     if my_ff < my_len:
         return -1000
+
+    # flood fill 余量：ff 越大于蛇长，说明越不容易被困死
+    # 这个指标直接惩罚"快把自己绕死"的走法
+    total_cells = width * height
+    ff_ratio = min(my_ff / max(my_len * 3, 1), 1.0)  # 0~1，ff 够大时=1
 
     # ① 吃食物奖励：使用 step_state 里记录的 my_just_ate 信号
     just_ate_bonus = 0.0
@@ -260,12 +285,25 @@ def evaluate(state, me_id, width, height):
     food_score = best_need_score * food_weight + proximity_bonus
 
     # ④ Mobility：我的头部下一步有几个合法方向
-    # 转圈的蛇会把自己逼入角落，mobility 天然下降
-    # 这是打破无记忆 Voronoi 转圈的关键
     next_moves = get_safe_moves(my_pos, state, me_id, my_len, width, height)
-    mobility = len(next_moves) / 4.0  # 归一化 0~1，4个方向时=1.0
+    mobility = len(next_moves) / 4.0  # 归一化 0~1
 
-    return voronoi_diff * w_voronoi + food_score + just_ate_bonus + mobility * 1.5
+    # ⑤ 中心吸引：离中心越近越好（防止永远贴边转）
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    max_dist = cx + cy
+    dist_center = abs(my_pos[0] - cx) + abs(my_pos[1] - cy)
+    center_score = 1.0 - (dist_center / max_dist)  # 0~1
+
+    # ⑥ flood fill 余量：ff 比蛇长够大时加分，防止自我绕死
+    # 转圈蛇的 ff 会越来越小（被自己身体压缩）
+    ff_bonus = ff_ratio * 1.0
+
+    return (voronoi_diff * w_voronoi
+            + food_score
+            + just_ate_bonus
+            + mobility * 1.0
+            + center_score * 0.3
+            + ff_bonus * 1.0)
 
 
 # ─────────────────────────────────────────────
