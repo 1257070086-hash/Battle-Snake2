@@ -11,10 +11,10 @@ def on_info():
     return jsonify({
         "apiversion": "1",
         "author": "dingding09",
-        "color": "#FF4500",       # 橙红色
-        "head": "pixel-round",
-        "tail": "pixel-round",
-        "version": "1.0.0",
+        "color": "#1E90FF",
+        "head": "default",
+        "tail": "default",
+        "version": "10.1.0",
     })
 
 
