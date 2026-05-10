@@ -273,15 +273,25 @@ def evaluate(state, me_id, width, height):
 
     food_score = best_food_score * food_weight
 
-    # ── ⑤ 中心偏置（仅短蛇期，防角落死）─────────────────────────
-    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
-    max_dist = cx + cy
-    dist_center = abs(my_pos[0] - cx) + abs(my_pos[1] - cy)
-    center_score = 1.0 - (dist_center / max_dist)
+    # ── ⑤ 位置安全分（直接惩罚边缘和角落）─────────────────────────
+    # 边缘格：只有 2-3 个相邻格，更容易被困死
+    # 角落格：只有 2 个相邻格，最危险
+    x, y = my_pos
+    # 离最近边界的距离（0=在边上，1=距边1格，...）
+    edge_dist = min(x, width-1-x, y, height-1-y)
+    # 0=角落/边缘 → 1=中心区域，分段线性
+    if edge_dist == 0:
+        pos_score = 0.0    # 在边上
+    elif edge_dist == 1:
+        pos_score = 0.4    # 距边1格
+    elif edge_dist == 2:
+        pos_score = 0.7    # 距边2格
+    else:
+        pos_score = 1.0    # 内部安全区
 
     return (space_score  * w_space
             + food_score
-            + center_score * w_center)
+            + pos_score  * w_center)
 
 
 # ─────────────────────────────────────────────
